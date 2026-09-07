@@ -51,7 +51,7 @@ jobs:
           HOURS: ${{ github.event.inputs.hours }}
           FORCE: ${{ github.event.inputs.force }}
         run: |
-          ARGS="--chunks 12"
+          ARGS="--chunks 20"
           if [ -n "$RUN" ]; then ARGS="$ARGS --run $RUN"; fi
           if [ -n "$HOURS" ]; then ARGS="$ARGS --hours $HOURS"; fi
           if [ "$FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
