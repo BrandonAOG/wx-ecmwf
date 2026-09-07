@@ -129,6 +129,40 @@ def smooth(a, s=1.5):
     return gaussian_filter(a, s)
 
 
+
+def refine(lon, lat, *arrays, target=360, order=1):
+    """Upsample fields so shaded products don't show raw 0.25° cells on small
+    regions. Factor adapts to the grid: ~360 columns after refinement.
+    order=1 bilinear for continuous fields; pass order=0 for masks."""
+    from scipy.ndimage import zoom
+    factor = int(max(1, min(8, round(target / max(len(lon), 1)))))
+    if factor == 1:
+        return (lon, lat) + tuple(arrays)
+    lon2 = np.linspace(lon[0], lon[-1], (len(lon) - 1) * factor + 1)
+    lat2 = np.linspace(lat[0], lat[-1], (len(lat) - 1) * factor + 1)
+    out = []
+    for a in arrays:
+        a = np.asarray(a, dtype=float)
+        z = zoom(np.nan_to_num(a, nan=0.0), factor, order=order, mode="nearest", grid_mode=True)
+        out.append(z[:len(lat2), :len(lon2)])
+    return (lon2, lat2) + tuple(out)
+
+
+def mesh(ax, lon, lat, data, mask_below=None, mask=None, **kw):
+    """pcolormesh with adaptive upsampling. mask_below hides values under a
+    threshold; mask (bool, same grid as data) hides True cells (nearest-neighbour)."""
+    arrays = [data] + ([mask.astype(float)] if mask is not None else [])
+    res = refine(lon, lat, *arrays)
+    lon2, lat2, d2 = res[0], res[1], res[2]
+    if mask is not None:
+        m2 = refine(lon, lat, mask.astype(float), order=0)[2] > 0.5
+        d2 = np.ma.masked_where(m2, d2)
+    if mask_below is not None:
+        d2 = np.ma.masked_less(d2, mask_below)
+    kw.setdefault("shading", "auto")
+    return ax.pcolormesh(lon2, lat2, d2, **kw)
+
+
 # ------------------------------------------------------------- parameters ---
 
 def plot_z500_vort(f, meta):
@@ -161,8 +195,7 @@ def plot_mslp_precip(f, meta):
     cmap, norm, bounds = _precip_cmap()
     if "tp_6" in f:
         precip_in = pick(f, "tp_6") / 25.4
-        cf = ax.pcolormesh(lon, lat, np.ma.masked_less(precip_in, 0.01), cmap=cmap, norm=norm,
-                           transform=PC, zorder=2, shading="auto")
+        cf = mesh(ax, lon, lat, precip_in, 0.01, cmap=cmap, norm=norm, transform=PC, zorder=2)
         colorbar(fig, cf, "6-hr precipitation (in)", ticks=bounds)
     else:
         ax.text(0.5, 0.5, "No accumulated precipitation at hour 000", transform=ax.transAxes,
@@ -224,8 +257,7 @@ def plot_wind10m(f, meta):
               "#f5a623", "#f05a28", "#d0021b", "#9b0c3d", "#5e0a5e"]
     cmap = mcolors.ListedColormap(colors)
     norm = mcolors.BoundaryNorm(bounds, len(colors))
-    cf = ax.pcolormesh(lon, lat, np.ma.masked_less(spd, 10), cmap=cmap, norm=norm,
-                       transform=PC, zorder=2, shading="auto")
+    cf = mesh(ax, lon, lat, spd, 10, cmap=cmap, norm=norm, transform=PC, zorder=2)
     barbs(ax, lon, lat, u, v, color="#222")
     if "prmsl" in f:
         mslp = smooth(pick(f, "prmsl") / 100)
@@ -261,8 +293,7 @@ def plot_cape(f, meta):
               "#f05a28", "#d0021b", "#9b0c3d", "#5e0a5e"]
     cmap = mcolors.ListedColormap(colors)
     norm = mcolors.BoundaryNorm(bounds, len(colors))
-    cf = ax.pcolormesh(lon, lat, np.ma.masked_less(cape, 100), cmap=cmap, norm=norm,
-                       transform=PC, zorder=2, shading="auto")
+    cf = mesh(ax, lon, lat, cape, 100, cmap=cmap, norm=norm, transform=PC, zorder=2)
     if "u850" in f:
         barbs(ax, lon, lat, pick(f, "u850") * 1.944, pick(f, "v850") * 1.944, color="#c81e1e")
     if "u500" in f:
@@ -391,8 +422,7 @@ def plot_mslp_ptype(f, meta):
                            (ice, plt.get_cmap("Purples")), (frzr, plt.get_cmap("Reds"))]:
             cm = mcolors.ListedColormap(cmap(np.linspace(0.25, 1, len(bounds) - 1)))
             norm = mcolors.BoundaryNorm(bounds, cm.N)
-            ax.pcolormesh(lon, lat, np.ma.masked_where(~mask | (p < 0.01), p), cmap=cm, norm=norm,
-                          transform=PC, zorder=2, shading="auto")
+            mesh(ax, lon, lat, p, 0.01, mask=~mask, cmap=cm, norm=norm, transform=PC, zorder=2)
         cf = ax.pcolormesh(lon, lat, np.ma.masked_all(p.shape), cmap=mcolors.ListedColormap(plt.get_cmap("Greens")(np.linspace(0.25, 1, len(bounds) - 1))),
                            norm=mcolors.BoundaryNorm(bounds, len(bounds) - 1), transform=PC, zorder=1, shading="auto")
         colorbar(fig, cf, "6-hr precipitation (in) — colour = type", ticks=bounds)
@@ -414,8 +444,7 @@ def plot_refc(f, meta):
     snow, ice, frzr, rain = ptype_masks(f)
     norm = mcolors.BoundaryNorm(REFC_BOUNDS, 14)
     for mask, cmap in [(rain, REFC_RAIN), (snow, REFC_SNOW), (ice, REFC_ICE), (frzr, REFC_FRZR)]:
-        ax.pcolormesh(lon, lat, np.ma.masked_where(~mask | (refc < 5), refc), cmap=cmap, norm=norm,
-                      transform=PC, zorder=2, shading="auto")
+        mesh(ax, lon, lat, refc, 5, mask=~mask, cmap=cmap, norm=norm, transform=PC, zorder=2)
     cf = ax.pcolormesh(lon, lat, np.ma.masked_all(refc.shape), cmap=REFC_RAIN, norm=norm, transform=PC, zorder=1, shading="auto")
     mslp_contours(ax, f, lw=0.7)
     add_basemap(ax)
@@ -431,7 +460,7 @@ def _accum_plot(f, meta, key, label, title_txt):
     if key in f:
         p = f[key] / 25.4
         norm = mcolors.BoundaryNorm(PRECIP_BIG_BOUNDS, PRECIP_BIG_CMAP.N)
-        cf = ax.pcolormesh(lon, lat, np.ma.masked_less(p, 0.01), cmap=PRECIP_BIG_CMAP, norm=norm, transform=PC, zorder=2, shading="auto")
+        cf = mesh(ax, lon, lat, p, 0.01, cmap=PRECIP_BIG_CMAP, norm=norm, transform=PC, zorder=2)
         colorbar(fig, cf, label, ticks=PRECIP_BIG_BOUNDS)
     else:
         ax.text(0.5, 0.5, "Not available at this hour", transform=ax.transAxes, ha="center", fontsize=11, color="#666", zorder=9)
@@ -461,7 +490,7 @@ def plot_snow24(f, meta):
     if total is not None:
         inches = total / 25.4 * 10
         norm = mcolors.BoundaryNorm(SNOW_BOUNDS, SNOW_CMAP.N)
-        cf = ax.pcolormesh(lon, lat, np.ma.masked_less(inches, 0.1), cmap=SNOW_CMAP, norm=norm, transform=PC, zorder=2, shading="auto")
+        cf = mesh(ax, lon, lat, inches, 0.1, cmap=SNOW_CMAP, norm=norm, transform=PC, zorder=2)
         colorbar(fig, cf, "24-hr snowfall, 10:1 ratio (in)", ticks=SNOW_BOUNDS)
     else:
         ax.text(0.5, 0.5, "Not available at this hour", transform=ax.transAxes, ha="center", fontsize=11, color="#666", zorder=9)
@@ -477,7 +506,7 @@ def _snod_change(f, meta, other, label, title_txt):
     if "snod" in f and other in f:
         change = (f["snod"] - f[other]) * 39.37
         norm = mcolors.BoundaryNorm(SNOW_BOUNDS, SNOW_CMAP.N)
-        cf = ax.pcolormesh(lon, lat, np.ma.masked_less(change, 0.1), cmap=SNOW_CMAP, norm=norm, transform=PC, zorder=2, shading="auto")
+        cf = mesh(ax, lon, lat, change, 0.1, cmap=SNOW_CMAP, norm=norm, transform=PC, zorder=2)
         colorbar(fig, cf, label, ticks=SNOW_BOUNDS)
     else:
         ax.text(0.5, 0.5, "Not available at this hour", transform=ax.transAxes, ha="center", fontsize=11, color="#666", zorder=9)
@@ -556,7 +585,7 @@ def plot_z850_wind(f, meta):
     bounds = [20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100, 120]
     cmap = plt.get_cmap("plasma_r", len(bounds) - 1)
     norm = mcolors.BoundaryNorm(bounds, cmap.N)
-    cf = ax.pcolormesh(lon, lat, np.ma.masked_less(spd, 20), cmap=cmap, norm=norm, transform=PC, zorder=2, shading="auto")
+    cf = mesh(ax, lon, lat, spd, 20, cmap=cmap, norm=norm, transform=PC, zorder=2)
     contour_labeled(ax, lon, lat, smooth(pick(f, "gh850") / 10), np.arange(100, 180, 3), "black", 0.9)
     barbs(ax, lon, lat, u, v, color="#333")
     add_basemap(ax)
@@ -573,7 +602,7 @@ def plot_wind250(f, meta):
     bounds = [50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 160, 180, 200]
     cmap = plt.get_cmap("viridis", len(bounds) - 1)
     norm = mcolors.BoundaryNorm(bounds, cmap.N)
-    cf = ax.pcolormesh(lon, lat, np.ma.masked_less(spd, 50), cmap=cmap, norm=norm, transform=PC, zorder=2, shading="auto")
+    cf = mesh(ax, lon, lat, spd, 50, cmap=cmap, norm=norm, transform=PC, zorder=2)
     contour_labeled(ax, lon, lat, smooth(pick(f, "gh250") / 10), np.arange(960, 1140, 12), "black", 0.9)
     barbs(ax, lon, lat, u, v, color="#333")
     add_basemap(ax)
@@ -695,7 +724,7 @@ def plot_shear(f, meta):
     colors = ["#e8f6e8", "#a8dba8", "#59b559", "#f7e530", "#f5a623", "#f05a28", "#d0021b", "#9b0c3d", "#5e0a5e"]
     cmap = mcolors.ListedColormap(colors)
     norm = mcolors.BoundaryNorm(bounds, cmap.N)
-    cf = ax.pcolormesh(lon, lat, np.ma.masked_less(mag, 5), cmap=cmap, norm=norm, transform=PC, zorder=2, shading="auto")
+    cf = mesh(ax, lon, lat, mag, 5, cmap=cmap, norm=norm, transform=PC, zorder=2)
     every = max(1, len(lon) // 26)
     ax.quiver(lon[::every], lat[::every], du[::every, ::every], dv[::every, ::every], transform=PC, zorder=7,
               scale=900, width=0.0016, color="#222", pivot="middle")
@@ -718,7 +747,7 @@ def plot_steering(f, meta):
     bounds = [5, 10, 15, 20, 25, 30, 40, 50, 60]
     cmap = plt.get_cmap("YlGnBu", len(bounds) - 1)
     norm = mcolors.BoundaryNorm(bounds, cmap.N)
-    cf = ax.pcolormesh(lon, lat, np.ma.masked_less(spd, 5), cmap=cmap, norm=norm, transform=PC, zorder=2, shading="auto")
+    cf = mesh(ax, lon, lat, spd, 5, cmap=cmap, norm=norm, transform=PC, zorder=2)
     ax.streamplot(lon, lat, u, v, density=1.6, color="#222", linewidth=0.6, arrowsize=0.7, transform=PC, zorder=6)
     mslp_contours(ax, f, color="#8b0000", lw=0.7, labels=False)
     add_basemap(ax)
