@@ -59,17 +59,13 @@ def latest_available_run(now: dt.datetime | None = None,
     now = now or dt.datetime.now(dt.timezone.utc)
     session = session or requests.Session()
     if MODEL["source"] == "ecmwf_opendata":
-        # A run is complete when its last step's file exists on the open-data server.
-        last = MODEL["hours"][-1]
+        # A run is complete when its last step's file exists on the open-data
+        # server. 06/18Z runs are published to a shorter range, so probe the
+        # possible final steps from longest to shortest.
         for cand in _candidate_cycles(now):
-            url = ECMWF_FILE.format(ymd=cand.strftime("%Y%m%d"), hh=cand.strftime("%H"), step=last)
-            try:
-                r = session.head(url, timeout=30, allow_redirects=True)
-                if r.status_code == 200:
-                    return cand
-                log.info("ECMWF %s not complete yet (HTTP %s)", cand.strftime("%Y%m%d %HZ"), r.status_code)
-            except requests.RequestException as e:
-                log.warning("HEAD %s failed: %s", url, e)
+            if run_max_hour(cand, session) is not None:
+                return cand
+            log.info("ECMWF %s not complete yet", cand.strftime("%Y%m%d %HZ"))
         raise RuntimeError("No complete ECMWF run found in the last 48 h")
     for cand in _candidate_cycles(now):
         url = NOMADS_IDX.format(ymd=cand.strftime("%Y%m%d"), hh=cand.strftime("%H"))
@@ -79,6 +75,22 @@ def latest_available_run(now: dt.datetime | None = None,
         except requests.RequestException as e:
             log.warning("HEAD %s failed: %s", url, e)
     raise RuntimeError("No GFS run found on NOMADS in the last 48 h")
+
+
+def run_max_hour(run: dt.datetime, session: requests.Session | None = None) -> int | None:
+    """Furthest forecast hour available for this run, or None if the run isn't
+    complete at any known range. GFS is always the full range."""
+    if MODEL["source"] != "ecmwf_opendata":
+        return MODEL["hours"][-1]
+    session = session or requests.Session()
+    for last in MODEL.get("probe_max_hours", [MODEL["hours"][-1]]):
+        url = ECMWF_FILE.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), step=last)
+        try:
+            if session.head(url, timeout=30, allow_redirects=True).status_code == 200:
+                return last
+        except requests.RequestException as e:
+            log.warning("HEAD %s failed: %s", url, e)
+    return None
 
 
 def all_fetch_pairs(param_ids: list[str]) -> set[tuple[str, str]]:

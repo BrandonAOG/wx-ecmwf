@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import requests  # noqa: E402
 
 from config import FORECAST_HOURS, MODEL  # noqa: E402
-from fetch import latest_available_run  # noqa: E402
+from fetch import latest_available_run, run_max_hour  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("check")
@@ -61,9 +61,12 @@ def main():
     session.headers["User-Agent"] = "wxmodels-check (github actions)"
 
     if args.run:
-        run_id = args.run
+        run = dt.datetime.strptime(args.run, "%Y%m%d%H").replace(tzinfo=dt.timezone.utc)
     else:
-        run_id = latest_available_run(session=session).strftime("%Y%m%d%H")
+        run = latest_available_run(session=session)
+    run_id = run.strftime("%Y%m%d%H")
+    cap = run_max_hour(run, session) or hours[-1]
+    hours = [h for h in hours if h <= cap]          # 06/18Z ECMWF runs are shorter
 
     published = None
     site = os.environ.get("SITE_URL")

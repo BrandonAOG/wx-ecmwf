@@ -29,10 +29,11 @@ MODELS = {
         "name": "ECMWF",
         "resolution": "0.25°",
         "source": "ecmwf_opendata",
-        "cycles": [0, 12],             # 06/18 only run to 90 h; skip them for now
-        "min_age_hours": 8,
-        # open data: 3-hourly to 144 h, 6-hourly to 240 h
+        "cycles": [0, 6, 12, 18],      # 06/18 are published with a shorter range; probed at run time
+        "min_age_hours": 7,
+        # open data: 3-hourly to 144 h, 6-hourly to 240 h (00/12); 06/18 stop earlier
         "hours": list(range(0, 241, 6)),
+        "probe_max_hours": [240, 144, 90],
         "params": None,                 # None = every product whose "ecmwf" spec isn't None
         "credit": "ECMWF open data (CC-BY-4.0)",
     },
