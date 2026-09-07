@@ -680,3 +680,119 @@ def plot_okubo850(f, meta):
     colorbar(fig, cf, "Okubo-Weiss (10⁻⁹ s⁻²; negative = rotation-dominated) · blue segments = dilatation axes", ticks=levels[::2])
     title(fig, ax, meta, "850 mb Okubo-Weiss parameter & dilatation axes")
     return fig
+
+
+# ---------------------------------------------------- tropical --------------
+
+def plot_shear(f, meta):
+    """850–200 mb bulk shear: the classic deep-layer shear a tropical cyclone feels."""
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    du = (pick(f, "u200") - pick(f, "u850")) * 1.944
+    dv = (pick(f, "v200") - pick(f, "v850")) * 1.944
+    mag = smooth(np.hypot(du, dv), 1.0)
+    bounds = [5, 10, 15, 20, 25, 30, 40, 50, 60, 80]
+    colors = ["#e8f6e8", "#a8dba8", "#59b559", "#f7e530", "#f5a623", "#f05a28", "#d0021b", "#9b0c3d", "#5e0a5e"]
+    cmap = mcolors.ListedColormap(colors)
+    norm = mcolors.BoundaryNorm(bounds, cmap.N)
+    cf = ax.pcolormesh(lon, lat, np.ma.masked_less(mag, 5), cmap=cmap, norm=norm, transform=PC, zorder=2, shading="auto")
+    every = max(1, len(lon) // 26)
+    ax.quiver(lon[::every], lat[::every], du[::every, ::every], dv[::every, ::every], transform=PC, zorder=7,
+              scale=900, width=0.0016, color="#222", pivot="middle")
+    if "gh500" in f:
+        contour_labeled(ax, lon, lat, smooth(f["gh500"] / 10), np.arange(480, 620, 6), "black", 0.7)
+    add_basemap(ax)
+    colorbar(fig, cf, "850–200 mb shear (kt) — under 20 kt favours tropical development", ticks=bounds)
+    title(fig, ax, meta, "850–200 mb wind shear (kt, arrows show shear vector) & 500 mb height (dam)")
+    return fig
+
+
+def plot_steering(f, meta):
+    """Pressure-weighted 850–300 mb mean wind, a proxy for tropical cyclone steering."""
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    w = {850: 0.4, 500: 0.35, 300: 0.25}
+    u = sum(pick(f, f"u{p}") * k for p, k in w.items()) * 1.944
+    v = sum(pick(f, f"v{p}") * k for p, k in w.items()) * 1.944
+    spd = smooth(np.hypot(u, v), 1.0)
+    bounds = [5, 10, 15, 20, 25, 30, 40, 50, 60]
+    cmap = plt.get_cmap("YlGnBu", len(bounds) - 1)
+    norm = mcolors.BoundaryNorm(bounds, cmap.N)
+    cf = ax.pcolormesh(lon, lat, np.ma.masked_less(spd, 5), cmap=cmap, norm=norm, transform=PC, zorder=2, shading="auto")
+    ax.streamplot(lon, lat, u, v, density=1.6, color="#222", linewidth=0.6, arrowsize=0.7, transform=PC, zorder=6)
+    mslp_contours(ax, f, color="#8b0000", lw=0.7, labels=False)
+    add_basemap(ax)
+    colorbar(fig, cf, "850–300 mb layer-mean wind (kt)", ticks=bounds)
+    title(fig, ax, meta, "850–300 mb steering flow (kt, streamlines) & MSLP (mb, dark red)")
+    return fig
+
+
+def plot_div200(f, meta):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    u, v = pick(f, "u200"), pick(f, "v200")
+    dx, dy = grid_spacing(lon, lat)
+    div = smooth(ddx(u, dx) + ddy(v, dy), 1.5) * 1e5
+    levels = np.arange(2, 14.1, 1)
+    cf = ax.contourf(lon, lat, div, levels=levels, cmap="Purples", extend="max", transform=PC, zorder=2)
+    ax.contour(lon, lat, div, levels=-levels[::-1], colors="#b35806", linewidths=0.5, linestyles="dashed", transform=PC, zorder=3)
+    contour_labeled(ax, lon, lat, smooth(pick(f, "gh200") / 10), np.arange(1140, 1290, 6), "black", 0.6)
+    barbs(ax, lon, lat, u * 1.944, v * 1.944, color="#333")
+    add_basemap(ax)
+    colorbar(fig, cf, "200 mb divergence (10⁻⁵ s⁻¹) — shaded positive; dashed brown = convergence", ticks=levels[::2])
+    title(fig, ax, meta, "200 mb divergence, wind (kt) & height (dam)")
+    return fig
+
+
+def plot_rh700(f, meta):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    rh = pick(f, "r700")
+    levels = np.arange(0, 101, 10)
+    cf = ax.contourf(lon, lat, rh, levels=levels, cmap="BrBG", transform=PC, zorder=2)
+    if "gh700" in f:
+        contour_labeled(ax, lon, lat, smooth(f["gh700"] / 10), np.arange(270, 330, 3), "black", 0.6)
+    barbs(ax, lon, lat, pick(f, "u700") * 1.944, pick(f, "v700") * 1.944, color="#333")
+    add_basemap(ax)
+    colorbar(fig, cf, "700 mb relative humidity (%) — browns = dry air intrusion", ticks=levels)
+    title(fig, ax, meta, "700 mb relative humidity (%), wind (kt) & height (dam)")
+    return fig
+
+
+def plot_sst(f, meta):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    t = pick(f, "t_sfc", "skt", "t") - 273.15
+    land = pick(f, "lsm", "land")
+    sst = np.ma.masked_where(land > 0.5, t)
+    levels = np.arange(18, 33.1, 0.5)
+    cf = ax.contourf(lon, lat, sst, levels=levels, cmap="turbo", extend="both", transform=PC, zorder=2)
+    ax.contour(lon, lat, sst, levels=[26.5], colors="white", linewidths=1.4, transform=PC, zorder=4)
+    ax.contour(lon, lat, sst, levels=[28, 30], colors="black", linewidths=0.6, transform=PC, zorder=4)
+    land50 = cfeature.LAND.with_scale("50m")
+    try:
+        next(iter(land50.geometries()))            # force the (cached) download now, not at save time
+        ax.add_feature(land50, facecolor="#d9d9d9", zorder=3)
+    except Exception:  # noqa: BLE001
+        pass
+    mslp_contours(ax, f, color="#333", lw=0.6, labels=False)
+    add_basemap(ax)
+    colorbar(fig, cf, "Sea surface temperature (°C) — white line 26.5 °C, black 28 & 30 °C", ticks=levels[::4])
+    title(fig, ax, meta, "Sea surface temperature (°C) & MSLP (mb)")
+    return fig
+
+
+def plot_vort_layer(f, meta):
+    """850–500 mb layer-mean relative vorticity: tracks mid-level spins before a surface low forms."""
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    vort = np.mean([rel_vort(pick(f, f"u{p}"), pick(f, f"v{p}"), lon, lat) for p in (850, 700, 500)], axis=0)
+    vort = smooth(vort, 1.2) * 1e5
+    levels = np.arange(2, 30.1, 2)
+    cf = ax.contourf(lon, lat, vort, levels=levels, cmap=VORT_CMAP, extend="max", transform=PC, zorder=2)
+    barbs(ax, lon, lat, pick(f, "u700") * 1.944, pick(f, "v700") * 1.944, color="#333")
+    mslp_contours(ax, f, lw=0.7)
+    add_basemap(ax)
+    colorbar(fig, cf, "850–500 mb mean relative vorticity (10⁻⁵ s⁻¹)", ticks=levels[::2])
+    title(fig, ax, meta, "850–500 mb layer-mean vorticity, 700 mb wind (kt) & MSLP (mb)")
+    return fig
