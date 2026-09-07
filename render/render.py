@@ -37,7 +37,7 @@ import requests  # noqa: E402
 import plots  # noqa: E402
 import storage  # noqa: E402
 from config import (FORECAST_HOURS, KEEP_RUNS, MODEL, PARAMS, REGIONS, model_params, param_hours)  # noqa: E402
-from fetch import (all_fetch_pairs, build_filter_url, crop, download, download_ecmwf, download_grouped, ecmwf_pairs,
+from fetch import (all_fetch_pairs, build_filter_url, crop, download, download_ecmwf, download_files, download_grouped, ecmwf_pairs,
                    latest_available_run, load_grib, merge, normalise, prev_steps, step_for,
                    synthetic_fields)  # noqa: E402
 
@@ -213,20 +213,22 @@ def main():
             for region in args.regions:
                 grib_paths[(fhr, region)] = None
             continue
-        if MODEL["source"] == "ecmwf_opendata":
+        if MODEL["source"] != "nomads":
+            fetch = download_ecmwf if MODEL["source"] == "ecmwf_opendata" else \
+                    (lambda r, st, prs, d: download_files(r, st, prs, d, session))
             files = {}
             try:
-                files[""] = str(download_ecmwf(run, fhr, ecmwf_pairs(args.params), grib_dir / f"global_f{fhr:03d}.grib2"))
-            except RuntimeError as e:
-                log.error("%s", e); continue
+                files[""] = str(fetch(run, fhr, ecmwf_pairs(args.params), grib_dir / f"global_f{fhr:03d}.grib2"))
+            except (RuntimeError, Exception) as e:  # noqa: BLE001
+                log.error("f%03d: %s", fhr, e); continue
             for off, spec in prev.items():
                 step = step_for(fhr, off)
                 if step is None or not spec["ecmwf"]:
                     continue
                 tag = "_f0" if off == "f0" else f"_m{off}"
                 try:
-                    files[tag] = str(download_ecmwf(run, step, spec["ecmwf"], grib_dir / f"global_f{step:03d}_{tag}.grib2"))
-                except RuntimeError as e:
+                    files[tag] = str(fetch(run, step, spec["ecmwf"], grib_dir / f"global_f{step:03d}_{tag}.grib2"))
+                except Exception as e:  # noqa: BLE001
                     log.warning("%s", e)
             for region in args.regions:
                 grib_paths[(fhr, region)] = files
@@ -266,7 +268,7 @@ def main():
 
     # 1b. second pass: anything that failed gets one more try after the server has had a breather
     missing = [(fhr, region) for fhr in hours for region in args.regions
-               if not args.synthetic and (fhr, region) not in grib_paths and MODEL["source"] != "ecmwf_opendata"]
+               if not args.synthetic and (fhr, region) not in grib_paths and MODEL["source"] == "nomads"]
     if missing:
         log.info("retrying %d failed frame downloads", len(missing))
         time.sleep(60)

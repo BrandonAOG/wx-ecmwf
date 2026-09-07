@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import time
 from pathlib import Path
 from urllib.parse import urlencode
@@ -58,15 +59,14 @@ def latest_available_run(now: dt.datetime | None = None,
     """Newest cycle that's actually on the server."""
     now = now or dt.datetime.now(dt.timezone.utc)
     session = session or requests.Session()
-    if MODEL["source"] == "ecmwf_opendata":
-        # A run is complete when its last step's file exists on the open-data
-        # server. 06/18Z runs are published to a shorter range, so probe the
-        # possible final steps from longest to shortest.
+    if MODEL["source"] != "nomads":
+        # A run is complete when its last step's file exists. Some cycles are
+        # published to a shorter range, so probe possible final steps longest-first.
         for cand in _candidate_cycles(now):
             if run_max_hour(cand, session) is not None:
                 return cand
-            log.info("ECMWF %s not complete yet", cand.strftime("%Y%m%d %HZ"))
-        raise RuntimeError("No complete ECMWF run found in the last 48 h")
+            log.info("%s %s not complete yet", MODEL["name"], cand.strftime("%Y%m%d %HZ"))
+        raise RuntimeError(f"No complete {MODEL['name']} run found in the last 48 h")
     for cand in _candidate_cycles(now):
         url = NOMADS_IDX.format(ymd=cand.strftime("%Y%m%d"), hh=cand.strftime("%H"))
         try:
@@ -77,14 +77,26 @@ def latest_available_run(now: dt.datetime | None = None,
     raise RuntimeError("No GFS run found on NOMADS in the last 48 h")
 
 
+def _probe_url(run: dt.datetime, step: int) -> str | None:
+    """A file whose presence means `step` of this run is published."""
+    src = MODEL["source"]
+    if src == "ecmwf_opendata":
+        return ECMWF_FILE.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), step=step)
+    if src == "cmc":
+        return cmc_urls(run, step, {("msl", None)})[0]
+    if src == "icon":
+        return icon_urls(run, step, {("msl", None)})[0]
+    return None
+
+
 def run_max_hour(run: dt.datetime, session: requests.Session | None = None) -> int | None:
     """Furthest forecast hour available for this run, or None if the run isn't
     complete at any known range. GFS is always the full range."""
-    if MODEL["source"] != "ecmwf_opendata":
+    if MODEL["source"] == "nomads":
         return MODEL["hours"][-1]
     session = session or requests.Session()
     for last in MODEL.get("probe_max_hours", [MODEL["hours"][-1]]):
-        url = ECMWF_FILE.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), step=last)
+        url = _probe_url(run, last)
         try:
             if session.head(url, timeout=30, allow_redirects=True).status_code == 200:
                 return last
@@ -100,11 +112,22 @@ def all_fetch_pairs(param_ids: list[str]) -> set[tuple[str, str]]:
     return pairs
 
 
-def ecmwf_pairs(param_ids: list[str]) -> set[tuple]:
+def spec_pairs(param_ids: list[str]) -> set[tuple]:
+    """Generic (field, level) pairs for non-GFS sources, minus fields the
+    current source can't supply (e.g. vorticity, computed from u/v instead)."""
+    from config import SOURCE_FIELDS
+    have = SOURCE_FIELDS.get(MODEL["source"], set())
     pairs: set[tuple] = set()
     for pid in param_ids:
-        pairs.update(PARAMS[pid].get("ecmwf") or [])
+        for name, lev in (PARAMS[pid].get("spec") or []):
+            if name in have:
+                pairs.add((name, lev))
+            elif name == "vo":
+                pairs.update({("u", lev), ("v", lev)})
     return pairs
+
+
+ecmwf_pairs = spec_pairs   # backwards-compatible name
 
 
 def prev_steps(param_ids: list[str]) -> dict:
@@ -118,7 +141,7 @@ def prev_steps(param_ids: list[str]) -> dict:
         for off in spec["offsets"]:
             slot = out.setdefault(off, {"fetch": set(), "ecmwf": set()})
             slot["fetch"].update(spec.get("fetch", []))
-            slot["ecmwf"].update(spec.get("ecmwf", []))
+            slot["ecmwf"].update(spec.get("spec", spec.get("ecmwf", [])))
     return out
 
 
@@ -253,6 +276,132 @@ def download_grouped(run: dt.datetime, fhr: int, pairs: set, bbox, dest: Path,
     return dest
 
 
+# ------------------------------------------------------------- CMC GDPS -----
+# One GRIB2 per field per step on the MSC Datamart, global 0.15° lat-lon.
+CMC_URL = ("https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gem_global/15km/grib2/lat_lon/{hh}/{fhr:03d}/"
+           "CMC_glb_{var}_latlon.15x.15_{ymd}{hh}_P{fhr:03d}.grib2")
+CMC_NAMES = {   # generic (field, level) -> Datamart VAR_LEVELTYPE_LEVEL
+    "gh": "HGT_ISBL_{lev}", "t": "TMP_ISBL_{lev}", "u": "UGRD_ISBL_{lev}", "v": "VGRD_ISBL_{lev}",
+    "r": "RH_ISBL_{lev}", "vo": "ABSV_ISBL_{lev}",
+    "msl": "PRMSL_MSL_0", "tp": "APCP_SFC_0", "2t": "TMP_TGL_2", "10u": "UGRD_TGL_10", "10v": "VGRD_TGL_10",
+    "cape": "CAPE_SFC_0", "snod": "SNOD_SFC_0", "skt": "TMP_SFC_0", "lsm": "LAND_SFC_0",
+}
+
+
+def cmc_urls(run: dt.datetime, step: int, pairs: set) -> list[str]:
+    urls = []
+    for name, lev in pairs:
+        if name == "tp" and step == 0:
+            continue
+        tmpl = CMC_NAMES.get(name)
+        if not tmpl:
+            continue
+        urls.append(CMC_URL.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), fhr=step,
+                                   var=tmpl.format(lev=lev)))
+    return urls
+
+
+# ------------------------------------------------------------- DWD ICON -----
+# One bz2-compressed GRIB2 per field per step, on ICON's native triangular
+# grid. Regridded to 0.125° lat-lon with cdo using DWD's own weights file.
+ICON_BASE = "https://opendata.dwd.de/weather/nwp/icon/grib/{hh}/{vdir}/"
+ICON_SL = "icon_global_icosahedral_single-level_{ymd}{hh}_{fhr:03d}_{VAR}.grib2.bz2"
+ICON_PL = "icon_global_icosahedral_pressure-level_{ymd}{hh}_{fhr:03d}_{lev}_{VAR}.grib2.bz2"
+ICON_TI = "icon_global_icosahedral_time-invariant_{ymd}{hh}_{VAR}.grib2.bz2"
+ICON_NAMES = {  # generic -> (dir, VAR, kind)
+    "gh": ("fi", "FI", "pl"), "t": ("t", "T", "pl"), "u": ("u", "U", "pl"), "v": ("v", "V", "pl"), "r": ("relhum", "RELHUM", "pl"),
+    "msl": ("pmsl", "PMSL", "sl"), "tp": ("tot_prec", "TOT_PREC", "sl"), "2t": ("t_2m", "T_2M", "sl"),
+    "10u": ("u_10m", "U_10M", "sl"), "10v": ("v_10m", "V_10M", "sl"), "tcwv": ("tqv", "TQV", "sl"),
+    "cape": ("cape_ml", "CAPE_ML", "sl"), "snod": ("h_snow", "H_SNOW", "sl"), "skt": ("t_g", "T_G", "sl"),
+    "lsm": ("fr_land", "FR_LAND", "ti"),
+}
+ICON_WEIGHTS_URL = "https://opendata.dwd.de/weather/lib/cdo/ICON_GLOBAL2WORLD_0125_EASY.tar.bz2"
+ICON_WEIGHTS_DIR = Path(os.environ.get("ICON_WEIGHTS_DIR", str(Path.home() / ".cache" / "icon_weights")))
+
+
+def icon_urls(run: dt.datetime, step: int, pairs: set) -> list[str]:
+    ymd, hh = run.strftime("%Y%m%d"), run.strftime("%H")
+    urls = []
+    for name, lev in pairs:
+        if name not in ICON_NAMES or (name == "tp" and step == 0):
+            continue
+        vdir, VAR, kind = ICON_NAMES[name]
+        base = ICON_BASE.format(hh=hh, vdir=vdir)
+        if kind == "pl":
+            urls.append(base + ICON_PL.format(ymd=ymd, hh=hh, fhr=step, lev=lev, VAR=VAR))
+        elif kind == "sl":
+            urls.append(base + ICON_SL.format(ymd=ymd, hh=hh, fhr=step, VAR=VAR))
+        else:
+            urls.append(base + ICON_TI.format(ymd=ymd, hh=hh, VAR=VAR))
+    return urls
+
+
+def icon_weights() -> tuple[Path, Path]:
+    """DWD's cdo grid description + remap weights (cached; ~60 MB download)."""
+    import subprocess, tarfile
+    ICON_WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+    grid = next(ICON_WEIGHTS_DIR.rglob("target_grid_world_0125.txt"), None)
+    wts = next(ICON_WEIGHTS_DIR.rglob("weights_icogl2world_0125.nc"), None)
+    if grid and wts:
+        return grid, wts
+    tb = ICON_WEIGHTS_DIR / "weights.tar.bz2"
+    log.info("downloading ICON regrid weights")
+    r = requests.get(ICON_WEIGHTS_URL, timeout=600); r.raise_for_status()
+    tb.write_bytes(r.content)
+    with tarfile.open(tb) as t:
+        t.extractall(ICON_WEIGHTS_DIR)
+    tb.unlink()
+    grid = next(ICON_WEIGHTS_DIR.rglob("target_grid_world_0125.txt"))
+    wts = next(ICON_WEIGHTS_DIR.rglob("weights_icogl2world_0125.nc"))
+    return grid, wts
+
+
+def icon_remap(src: Path, dest: Path):
+    import subprocess
+    grid, wts = icon_weights()
+    cmd = ["cdo", "-s", "-f", "grb2", f"remap,{grid},{wts}", str(src), str(dest)]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def download_files(run: dt.datetime, step: int, pairs: set, dest: Path, session: requests.Session,
+                   retries: int = 4) -> Path:
+    """CMC / ICON: fetch each field's file, concatenate (decompressing bz2 for
+    ICON), and for ICON regrid to lat-lon. Missing individual fields are logged
+    and skipped so one absent variable doesn't kill the frame."""
+    import bz2
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.stat().st_size > 1000:
+        return dest
+    urls = cmc_urls(run, step, pairs) if MODEL["source"] == "cmc" else icon_urls(run, step, pairs)
+    if not urls:
+        raise RuntimeError(f"nothing to fetch for step {step}")
+    raw = dest.with_suffix(".raw.grib2")
+    got = 0
+    with open(raw, "wb") as out:
+        for url in urls:
+            for attempt in range(retries):
+                try:
+                    r = session.get(url, timeout=180)
+                    if r.status_code == 200 and len(r.content) > 500:
+                        data = bz2.decompress(r.content) if url.endswith(".bz2") else r.content
+                        out.write(data); got += 1
+                        break
+                    if r.status_code == 404:
+                        log.warning("missing: %s", url.rsplit("/", 1)[-1]); break
+                    log.warning("GET %s -> %s", url.rsplit("/", 1)[-1], r.status_code)
+                except (requests.RequestException, OSError) as e:
+                    log.warning("GET failed (%d): %s", attempt + 1, e)
+                time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
+    if got == 0:
+        raw.unlink(missing_ok=True)
+        raise RuntimeError(f"No fields downloaded for step {step}")
+    if MODEL["source"] == "icon":
+        icon_remap(raw, dest); raw.unlink()
+    else:
+        raw.rename(dest)
+    return dest
+
+
 class Fields(dict):
     """A dict of name -> 2D numpy array, plus shared lon/lat 1-D coordinates."""
     lon: np.ndarray
@@ -345,17 +494,32 @@ def normalise(f: "Fields", fhr: int = 0) -> "Fields":
     """Map model-specific names/units onto what plots.py expects:
     prmsl [Pa], tp_6 [mm/6 h], tp_acc [mm since t0], absv500 [s^-1], pwat [mm],
     t2m, u10, v10, t850 ... GFS is the reference convention."""
-    ecmwf = MODEL["source"] == "ecmwf_opendata"
-    if "msl" in f and "prmsl" not in f:
-        f["prmsl"] = f.pop("msl")
-    if "tcwv" in f and "pwat" not in f:
-        f["pwat"] = f.pop("tcwv")
+    src = MODEL["source"]
+    accum_from_zero = src in ("ecmwf_opendata", "cmc", "icon")
+    # ---- name aliases (any tag suffix)
+    alias = {"msl": "prmsl", "tcwv": "pwat", "tciwv": "pwat", "sde": "snod", "z": "gh"}
+    for k in list(f):
+        base, tag = (k.split("_m", 1)[0], "_m" + k.split("_m", 1)[1]) if "_m" in k and k.split("_m", 1)[1].isdigit() else \
+                    ((k[:-3], "_f0") if k.endswith("_f0") else (k, ""))
+        for old, new in alias.items():
+            if base == old or (base.startswith(old) and base[len(old):].isdigit()):
+                nk = new + base[len(old):] + tag
+                if nk not in f:
+                    f[nk] = f.pop(k)
+                    if old == "z":                                   # ICON geopotential m²/s² -> gpm
+                        f[nk] = f[nk] / 9.80665
+                break
     if "vo500" in f and "absv500" not in f:                      # relative -> absolute vorticity
         _, LAT = np.meshgrid(f.lon, f.lat)
         f["absv500"] = f["vo500"] + 2 * 7.2921e-5 * np.sin(np.radians(LAT))
-    if ecmwf:                                                    # ECMWF tp is metres accumulated since t0
-        for k in [k for k in f if k.startswith("tp_acc")]:
-            f[k] = f[k] * 1000.0
+    if "absv500" not in f and "u500" in f and "v500" in f:      # sources without vorticity: compute it
+        from plots import rel_vort
+        _, LAT = np.meshgrid(f.lon, f.lat)
+        f["absv500"] = rel_vort(f["u500"], f["v500"], f.lon, f.lat) + 2 * 7.2921e-5 * np.sin(np.radians(LAT))
+    if accum_from_zero:
+        if src == "ecmwf_opendata":                              # ECMWF tp is metres; CMC/ICON are mm
+            for k in [k for k in f if k.startswith("tp_acc")]:
+                f[k] = f[k] * 1000.0
         if "tp_acc" in f:
             prev = f.get("tp_acc_m6", np.zeros_like(f["tp_acc"]))
             f["tp_6"] = np.clip(f["tp_acc"] - prev, 0, None)
