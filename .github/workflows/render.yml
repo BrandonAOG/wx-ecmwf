@@ -1,0 +1,85 @@
+name: Render ECMWF maps and deploy
+
+on:
+  schedule:
+    # ECMWF open data 00Z/12Z runs are complete ~7.5–8 h after cycle time.
+    - cron: "20 8,20 * * *"
+  workflow_dispatch:
+    inputs:
+      run:
+        description: "Specific run YYYYMMDDHH (blank = latest available)"
+        required: false
+      hours:
+        description: "Forecast hours, e.g. 0-120/6 (blank = full 240 h)"
+        required: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  WX_MODEL: ecmwf
+  # Cloudflare R2 (optional). Set these as repository secrets; when absent the
+  # images ship inside the Pages artifact instead.
+  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_BUCKET: ${{ secrets.R2_BUCKET }}
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: System libraries (eccodes for GRIB, GEOS/PROJ for cartopy)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libeccodes-dev libgeos-dev libproj-dev
+
+      - name: Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache Natural Earth shapefiles
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/cartopy
+          key: natural-earth-50m-v1
+
+      - name: Render maps
+        env:
+          RUN: ${{ github.event.inputs.run }}
+          HOURS: ${{ github.event.inputs.hours }}
+        run: |
+          ARGS="--workers 4"
+          if [ -n "$HOURS" ]; then ARGS="$ARGS --hours $HOURS"; fi
+          if [ -n "$RUN" ]; then ARGS="$ARGS --run $RUN"; fi
+          python render/render.py $ARGS
+
+
+
+      - name: Upload site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: render
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
