@@ -195,7 +195,11 @@ def build_filter_url(run: dt.datetime, fhr: int, pairs: set[tuple[str, str]],
     return NOMADS_FILTER + "?" + urlencode(q, safe="\\()")
 
 
-def download(url: str, dest: Path, session: requests.Session, retries: int = 4) -> Path:
+BACKOFF = [5, 10, 20, 40, 60, 90]
+
+
+def download(url: str, dest: Path, session: requests.Session, retries: int = 6) -> Path:
+    """NOMADS returns 500/503 freely when busy; back off progressively."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 1000:
         return dest
@@ -205,11 +209,48 @@ def download(url: str, dest: Path, session: requests.Session, retries: int = 4) 
             if r.status_code == 200 and len(r.content) > 1000:
                 dest.write_bytes(r.content)
                 return dest
-            log.warning("GET %s -> %s (%d bytes)", url[:80], r.status_code, len(r.content))
+            log.warning("GET %s -> %s (%d bytes), attempt %d", url[:80], r.status_code, len(r.content), attempt + 1)
         except requests.RequestException as e:
-            log.warning("GET failed (%s): %s", attempt, e)
-        time.sleep(5 * (attempt + 1))
+            log.warning("GET failed (attempt %d): %s", attempt + 1, e)
+        time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
     raise RuntimeError(f"Failed to download {url}")
+
+
+def _group_of(lev: str) -> str:
+    if lev.endswith("_mb"):
+        return "iso"
+    if lev.startswith("PV"):
+        return "pv"
+    if lev.startswith("top_of_atmosphere"):
+        return "toa"
+    return "sfc"
+
+
+def download_grouped(run: dt.datetime, fhr: int, pairs: set, bbox, dest: Path,
+                     session: requests.Session, retries: int = 4) -> Path:
+    """GFS: NOMADS grib_filter chokes on one huge var×level request, so fetch in
+    groups (isobaric / surface-ish / PV / top-of-atmosphere) and concatenate.
+    A failing group is logged and skipped; the frame still renders what it can."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.stat().st_size > 1000:
+        return dest
+    groups: dict[str, set] = {}
+    for var, lev in pairs:
+        groups.setdefault(_group_of(lev), set()).add((var, lev))
+    parts = []
+    for name, grp in sorted(groups.items()):
+        part = dest.with_suffix(f".{name}.grb2")
+        try:
+            download(build_filter_url(run, fhr, grp, bbox), part, session, retries=retries)
+            parts.append(part)
+        except RuntimeError as e:
+            log.warning("f%03d group %s failed (%s): %s", fhr, name, sorted(grp)[:3], e)
+    if not parts:
+        raise RuntimeError(f"All download groups failed for f{fhr:03d}")
+    with open(dest, "wb") as out:
+        for part in parts:
+            out.write(part.read_bytes()); part.unlink()
+    return dest
 
 
 class Fields(dict):

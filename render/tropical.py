@@ -54,6 +54,8 @@ CURRENT_STORMS = "https://www.nhc.noaa.gov/CurrentStorms.json"
 ADECK = "https://ftp.nhc.noaa.gov/atcf/aid_public/a{sid}.dat.gz"
 BDECK = "https://ftp.nhc.noaa.gov/atcf/btk/b{sid}.dat"
 CONE = "https://www.nhc.noaa.gov/gis/forecast/archive/{sid}_5day_latest.zip"
+GTWO = "https://www.nhc.noaa.gov/xgtwo/gtwo_shapefiles.zip"     # outlook areas with 2/7-day probabilities
+INVEST_MAX_AGE_H = 30                                           # a-deck must have been touched this recently
 
 # ATCF "tech" codes -> display. Order here = legend order. Colours chosen so
 # the deterministic globals stand apart from hurricane models and consensus.
@@ -265,12 +267,24 @@ def plot_intensity(storm, newest, tracks, btrack, dest: Path):
     fig.savefig(dest, facecolor="white"); plt.close(fig)
 
 
-def plot_overview(basin, storms, dest: Path):
+def plot_overview(basin, storms, dest: Path, areas=()):
     bbox = {"al": (-100, -15, 5, 50), "ep": (-150, -85, 3, 35), "cp": (-180, -140, 3, 35)}.get(basin, (-100, -15, 5, 50))
     fig = plt.figure(figsize=(12, 7), dpi=100)
     ax = fig.add_axes([0.01, 0.05, 0.98, 0.86], projection=PC)
     ax.set_extent(bbox, crs=PC); ax.set_facecolor("#eef4f8")
     add_basemap(ax)
+    for a in areas:
+        if a["basin"] not in (basin, ""):
+            continue
+        try:
+            p7 = int(str(a["prob7"]).rstrip("%"))
+        except ValueError:
+            p7 = 0
+        col = "#e6c200" if p7 < 40 else "#f28c28" if p7 < 60 else "#d0021b"
+        ax.fill(a["lons"], a["lats"], color=col, alpha=0.25, transform=PC, zorder=2)
+        ax.plot(a["lons"], a["lats"], color=col, lw=1.2, transform=PC, zorder=3)
+        ax.text(np.mean(a["lons"]), np.mean(a["lats"]), f"{a['prob2']} / {a['prob7']}", fontsize=8.5, fontweight="bold",
+                ha="center", va="center", transform=PC, zorder=8, path_effects=[pe.withStroke(linewidth=3, foreground="white")])
     for s in storms:
         for lons, lats in s.get("_cone", []):
             ax.fill(lons, lats, color="#ffffff", alpha=0.5, transform=PC, zorder=3)
@@ -283,12 +297,16 @@ def plot_overview(basin, storms, dest: Path):
         if b:
             bb = np.array([(lo, la) for _, la, lo, *_ in b])
             ax.plot(bb[:, 0], bb[:, 1], color="#444", lw=1.6, transform=PC, zorder=5)
-        ax.plot(s["lon"], s["lat"], marker=(8, 2, 0), ms=13, color="#000", transform=PC, zorder=7)
-        ax.text(s["lon"] + 0.8, s["lat"] + 0.8, f"{s['name']}\n{s['intensity']} kt", fontsize=9, fontweight="bold",
+        if s.get("lat") is None:
+            continue
+        sym = "x" if s.get("invest") else (8, 2, 0)
+        ax.plot(s["lon"], s["lat"], marker=sym, ms=11 if s.get("invest") else 13, color="#000", mew=2, transform=PC, zorder=7)
+        lab = s["name"] + (f"\n{s['intensity']} kt" if s.get("intensity") else "")
+        ax.text(s["lon"] + 0.8, s["lat"] + 0.8, lab, fontsize=9, fontweight="bold",
                 transform=PC, zorder=8, path_effects=[pe.withStroke(linewidth=3, foreground="white")])
     names = {"al": "Atlantic", "ep": "East Pacific", "cp": "Central Pacific"}
     fig.text(0.01, 0.965, f"Active systems — {names.get(basin, basin)}", fontsize=14, fontweight="bold", va="center")
-    fig.text(0.01, 0.93, f"Updated {dt.datetime.now(dt.timezone.utc):%a %d %b %Y %H:%M}Z   ·   black line = NHC official forecast, shading = cone",
+    fig.text(0.01, 0.93, f"Updated {dt.datetime.now(dt.timezone.utc):%a %d %b %Y %H:%M}Z   ·   black line = NHC forecast, shading = cone   ·   X = invest   ·   outlook areas labelled 2-day / 7-day %",
              fontsize=9.5, color="#333", va="center")
     fig.text(0.01, 0.015, "WxModels · data: NOAA/NHC", fontsize=8.5, color="#666", va="center")
     fig.savefig(dest, facecolor="white"); plt.close(fig)
@@ -297,7 +315,7 @@ def plot_overview(basin, storms, dest: Path):
 # ---------------------------------------------------------------- data -----
 
 def storm_title(s):
-    return f"{s['classification']} {s['name']}"
+    return s["name"] if s.get("invest") else f"{s['classification']} {s['name']}"
 
 
 def load_storms(session):
@@ -314,6 +332,67 @@ def load_storms(session):
             "nhc_url": f"https://www.nhc.noaa.gov/graphics_{'at' if sid[:2]=='al' else 'ep'}{sid[3]}.shtml",
         })
     return out
+
+
+def find_invests(session, year: int, known_ids: set[str]) -> list[dict]:
+    """Invests (90–99) in the Atlantic / E. Pacific with a recently updated
+    a-deck. NHC's storm feed doesn't list them; the ATCF directory does."""
+    out = []
+    now = dt.datetime.now(dt.timezone.utc)
+    for basin in ("al", "ep"):
+        for n in range(90, 100):
+            sid = f"{basin}{n}{year}"
+            if sid in known_ids:
+                continue
+            try:
+                r = session.head(ADECK.format(sid=sid), timeout=20)
+                if r.status_code != 200 or "Last-Modified" not in r.headers:
+                    continue
+                mod = dt.datetime.strptime(r.headers["Last-Modified"], "%a, %d %b %Y %H:%M:%S %Z").replace(tzinfo=dt.timezone.utc)
+                if (now - mod).total_seconds() / 3600 > INVEST_MAX_AGE_H:
+                    continue
+            except Exception as e:  # noqa: BLE001
+                log.info("invest probe %s: %s", sid, e); continue
+            out.append({"id": sid, "basin": basin, "name": f"Invest {n}{'L' if basin == 'al' else 'E'}",
+                        "classification": "Invest", "lat": None, "lon": None, "intensity": None, "pressure": None,
+                        "movement": "", "advisory": mod.isoformat(), "invest": True,
+                        "nhc_url": "https://www.nhc.noaa.gov/gtwo.php?basin=" + ("atlc" if basin == "al" else "epac")})
+    return out
+
+
+def fill_from_bdeck(storm, btrack, bdeck_rows):
+    """Invests have no advisory: take position/intensity from the last best-track fix."""
+    if btrack:
+        _, la, lo, vm, mp = btrack[-1]
+        storm["lat"], storm["lon"] = la, lo
+        storm["intensity"] = vm; storm["pressure"] = mp
+
+
+def read_outlook_areas(session):
+    """NHC graphical outlook areas: [{lons, lats, prob2, prob7, basin}]"""
+    try:
+        import shapefile
+        z = zipfile.ZipFile(io.BytesIO(session.get(GTWO, timeout=60).content))
+        names = [n[:-4] for n in z.namelist() if n.endswith(".shp") and "areas" in n.lower()]
+        out = []
+        for base in names:
+            r = shapefile.Reader(shp=io.BytesIO(z.read(base + ".shp")), dbf=io.BytesIO(z.read(base + ".dbf")),
+                                 shx=io.BytesIO(z.read(base + ".shx")))
+            fields = [f[0] for f in r.fields[1:]]
+            for sr in r.shapeRecords():
+                rec = dict(zip(fields, sr.record))
+                pts = np.array(sr.shape.points)
+                if len(pts) < 3:
+                    continue
+                p2 = rec.get("PROB2DAY") or rec.get("prob2day") or ""
+                p7 = rec.get("PROB7DAY") or rec.get("prob7day") or ""
+                out.append({"lons": pts[:, 0], "lats": pts[:, 1], "prob2": str(p2).strip(), "prob7": str(p7).strip(),
+                            "basin": str(rec.get("BASIN", rec.get("basin", ""))).strip().lower() or ("al" if pts[:, 0].mean() > -100 else "ep"),
+                            "area": str(rec.get("AREA", rec.get("area", ""))).strip()})
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning("outlook areas unavailable: %s", e)
+        return []
 
 
 def synthetic_storm():
@@ -355,11 +434,17 @@ def main():
     session = requests.Session(); session.headers["User-Agent"] = "wxmodels-tropical (github actions)"
     OUT.mkdir(parents=True, exist_ok=True)
 
+    areas = []
     if args.synthetic:
         s, a_text, b_text = synthetic_storm()
         storms = [s]; decks = {s["id"]: (a_text, b_text, b"")}
+        areas = [{"lons": np.array([-45, -35, -33, -42, -48]), "lats": np.array([10, 11, 16, 18, 14]),
+                  "prob2": "20%", "prob7": "60%", "basin": "al", "area": ""}]
     else:
         storms = load_storms(session)
+        year = dt.datetime.now(dt.timezone.utc).year
+        storms += find_invests(session, year, {s["id"] for s in storms})
+        areas = read_outlook_areas(session)
         decks = {}
         for s in storms:
             try:
@@ -386,6 +471,11 @@ def main():
         btrack = sorted({c: v[0] for c, v in bdeck.get("BEST", {}).items()}.items())
         btrack = [(0, la, lo, vm, mp) for _, (_, la, lo, vm, mp) in btrack]
         cone = read_cone(cone_bytes) if cone_bytes else []
+        if s.get("invest"):
+            fill_from_bdeck(s, btrack, bdeck)
+            if s["lat"] is None and tracks:                   # no best track yet: use any model's t=0
+                _, la, lo, *_ = next(iter(tracks.values()))["pts"][0]
+                s["lat"], s["lon"] = la, lo
         s["_tracks"], s["_btrack"], s["_cone"] = tracks, btrack, cone
         sdir = OUT / s["id"]; sdir.mkdir(exist_ok=True)
         entry = {k: v for k, v in s.items() if not k.startswith("_")}
@@ -406,10 +496,12 @@ def main():
         result["storms"].append(entry)
         log.info("%s %s: %d model tracks", s["title"], s["id"], len(tracks))
 
-    for basin in sorted({s["basin"] for s in storms}):
+    for basin in sorted({s["basin"] for s in storms} | {a["basin"] for a in areas} | {"al"}):
         dest = OUT / f"overview_{basin}.png"
-        plot_overview(basin, [s for s in storms if s["basin"] == basin], dest)
+        plot_overview(basin, [s for s in storms if s["basin"] == basin], dest, areas)
         result["overviews"][basin] = f"images/tropical/overview_{basin}.png"
+    result["areas"] = [{"basin": a["basin"], "prob2": a["prob2"], "prob7": a["prob7"],
+                        "lat": round(float(np.mean(a["lats"])), 1), "lon": round(float(np.mean(a["lons"])), 1)} for a in areas]
 
     if storage.enabled():
         storage.delete_prefix("images/tropical/")

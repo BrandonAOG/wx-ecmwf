@@ -54,19 +54,29 @@ def new_map(meta):
     return fig, ax
 
 
+_BASEMAP = None
+
+
+def _basemap_layers():
+    """Load coastline/border/state geometries once per process. cartopy
+    re-reads the shapefiles for every new Feature object, which dominated
+    plot time. A missing Natural Earth download (no network) just skips the layer."""
+    global _BASEMAP
+    if _BASEMAP is None:
+        _BASEMAP = []
+        for feat, lw, col in [(cfeature.COASTLINE, 0.8, "#222"), (cfeature.BORDERS, 0.6, "#333"),
+                              (cfeature.STATES, 0.4, "#555")]:
+            try:
+                geoms = list(feat.with_scale("50m").geometries())
+                _BASEMAP.append((cfeature.ShapelyFeature(geoms, PC), lw, col))
+            except Exception as e:  # noqa: BLE001
+                log.warning("basemap layer unavailable (%s); skipping", str(e)[:60])
+    return _BASEMAP
+
+
 def add_basemap(ax):
-    """Coastlines/borders/states. Wrapped so a missing Natural Earth download
-    (no network) degrades to a plain map instead of crashing the whole run."""
-    feats = [(cfeature.COASTLINE, 0.8, "#222"), (cfeature.BORDERS, 0.6, "#333"),
-             (cfeature.STATES, 0.4, "#555")]
-    for feat, lw, col in feats:
-        f50 = feat.with_scale("50m")
-        try:
-            next(iter(f50.geometries()))      # forces the (cached) download now
-        except Exception as e:  # noqa: BLE001
-            log.warning("basemap layer unavailable (%s); skipping", str(e)[:60])
-            continue
-        ax.add_feature(f50, lw=lw, edgecolor=col, facecolor="none", zorder=5)
+    for feat, lw, col in _basemap_layers():
+        ax.add_feature(feat, lw=lw, edgecolor=col, facecolor="none", zorder=5)
     gl = ax.gridlines(draw_labels=False, lw=0.3, color="#888", alpha=0.5, linestyle=":")
     gl.xlocator = matplotlib.ticker.MultipleLocator(10)
     gl.ylocator = matplotlib.ticker.MultipleLocator(10)

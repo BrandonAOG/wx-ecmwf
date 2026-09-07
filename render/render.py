@@ -25,6 +25,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -36,7 +37,7 @@ import requests  # noqa: E402
 import plots  # noqa: E402
 import storage  # noqa: E402
 from config import (FORECAST_HOURS, KEEP_RUNS, MODEL, PARAMS, REGIONS, model_params, param_hours)  # noqa: E402
-from fetch import (all_fetch_pairs, build_filter_url, crop, download, download_ecmwf, ecmwf_pairs,
+from fetch import (all_fetch_pairs, build_filter_url, crop, download, download_ecmwf, download_grouped, ecmwf_pairs,
                    latest_available_run, load_grib, merge, normalise, prev_steps, step_for,
                    synthetic_fields)  # noqa: E402
 
@@ -206,6 +207,7 @@ def main():
     #    ECMWF: one global file per step, shared by every region.
     prev = prev_steps(args.params)
     grib_paths: dict[tuple[int, str], dict | None] = {}
+    gfs_jobs: list[tuple[int, str]] = []
     for fhr in hours:
         if args.synthetic:
             for region in args.regions:
@@ -230,26 +232,52 @@ def main():
                 grib_paths[(fhr, region)] = files
             continue
         for region in args.regions:
-            bbox = padded(REGIONS[region]["bbox"])
-            files = {}
+            gfs_jobs.append((fhr, region))
+
+    def fetch_gfs(job):
+        fhr, region = job
+        bbox = padded(REGIONS[region]["bbox"])
+        files = {}
+        try:
+            dest = grib_dir / f"{region}_f{fhr:03d}.grb2"
+            download_grouped(run, fhr, pairs, bbox, dest, session)
+            files[""] = str(dest)
+        except RuntimeError as e:
+            log.error("%s", e); return job, None
+        for off, spec in prev.items():
+            step = step_for(fhr, off)
+            if step is None or not spec["fetch"]:
+                continue
+            tag = "_f0" if off == "f0" else f"_m{off}"
+            dest = grib_dir / f"{region}_f{step:03d}{tag}.grb2"
             try:
-                dest = grib_dir / f"{region}_f{fhr:03d}.grb2"
-                download(build_filter_url(run, fhr, pairs, bbox), dest, session)
-                files[""] = str(dest)
+                download(build_filter_url(run, step, spec["fetch"], bbox), dest, session, retries=3)
+                files[tag] = str(dest)
             except RuntimeError as e:
-                log.error("%s", e); continue
-            for off, spec in prev.items():
-                step = step_for(fhr, off)
-                if step is None or not spec["fetch"]:
-                    continue
-                tag = "_f0" if off == "f0" else f"_m{off}"
-                dest = grib_dir / f"{region}_f{step:03d}{tag}.grb2"
-                try:
-                    download(build_filter_url(run, step, spec["fetch"], bbox), dest, session, retries=2)
-                    files[tag] = str(dest)
-                except RuntimeError as e:
-                    log.warning("%s", e)         # e.g. no APCP at step 0 — plots degrade gracefully
-            grib_paths[(fhr, region)] = files
+                log.warning("%s", e)         # e.g. no APCP at step 0 — plots degrade gracefully
+        return job, files
+
+    if gfs_jobs:
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        with _TPE(max_workers=3) as pool:          # NOMADS tolerates a few concurrent clients
+            for job, files in pool.map(fetch_gfs, gfs_jobs):
+                if files:
+                    grib_paths[job] = files
+
+    # 1b. second pass: anything that failed gets one more try after the server has had a breather
+    missing = [(fhr, region) for fhr in hours for region in args.regions
+               if not args.synthetic and (fhr, region) not in grib_paths and MODEL["source"] != "ecmwf_opendata"]
+    if missing:
+        log.info("retrying %d failed frame downloads", len(missing))
+        time.sleep(60)
+        for fhr, region in missing:
+            bbox = padded(REGIONS[region]["bbox"])
+            dest = grib_dir / f"{region}_f{fhr:03d}.grb2"
+            try:
+                download_grouped(run, fhr, pairs, bbox, dest, session, retries=6)
+                grib_paths[(fhr, region)] = {"": str(dest)}
+            except RuntimeError as e:
+                log.error("still failing: %s", e)
 
     # 2. render in parallel
     jobs = [(fhr, region, p) for (fhr, region), p in grib_paths.items()]
