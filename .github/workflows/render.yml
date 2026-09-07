@@ -2,15 +2,19 @@ name: Render ECMWF maps and deploy
 
 on:
   schedule:
-    # ECMWF open data 00Z/12Z runs are complete ~7.5–8 h after cycle time.
-    - cron: "20 8,20 * * *"
+    # Poll every 30 min; the check job exits in ~20 s when nothing new is out.
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
+      force:
+        description: "Re-render even if this run is already live"
+        type: boolean
+        default: false
       run:
         description: "Specific run YYYYMMDDHH (blank = latest available)"
         required: false
       hours:
-        description: "Forecast hours, e.g. 0-120/6 (blank = full 240 h)"
+        description: "Forecast hours, e.g. 0-120/6 (blank = model's full range)"
         required: false
 
 permissions:
@@ -18,64 +22,116 @@ permissions:
   pages: write
   id-token: write
 
+# One render at a time; a poll that fires mid-render waits, then sees the run is live and exits.
 concurrency:
-  group: pages
+  group: render
   cancel-in-progress: false
 
 env:
   WX_MODEL: ecmwf
-  # Cloudflare R2 (optional). Set these as repository secrets; when absent the
-  # images ship inside the Pages artifact instead.
-  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-  R2_BUCKET: ${{ secrets.R2_BUCKET }}
+  SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
 
 jobs:
-  render:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 200
+    timeout-minutes: 10
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+      needs_render: ${{ steps.check.outputs.needs_render }}
+      chunks: ${{ steps.check.outputs.chunks }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q requests numpy ecmwf-opendata
+      - id: check
+        env:
+          RUN: ${{ github.event.inputs.run }}
+          HOURS: ${{ github.event.inputs.hours }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          ARGS="--chunks 12"
+          if [ -n "$RUN" ]; then ARGS="$ARGS --run $RUN"; fi
+          if [ -n "$HOURS" ]; then ARGS="$ARGS --hours $HOURS"; fi
+          if [ "$FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
+          python render/check.py $ARGS
 
+  render:
+    needs: check
+    if: needs.check.outputs.needs_render == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJson(needs.check.outputs.chunks) }}
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-
       - name: System libraries (eccodes for GRIB, GEOS/PROJ for cartopy)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq libeccodes-dev libgeos-dev libproj-dev
-
-      - name: Python dependencies
-        run: pip install -r requirements.txt
-
+      - run: pip install -r requirements.txt
       - name: Cache Natural Earth shapefiles
         uses: actions/cache@v4
         with:
           path: ~/.local/share/cartopy
           key: natural-earth-50m-v1
+      - name: Render hours ${{ matrix.chunk }}
+        run: python render/render.py --run ${{ needs.check.outputs.run }} --hours "${{ matrix.chunk }}" --workers 4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ strategy.job-index }}
+          path: site/images
+          retention-days: 1
+          if-no-files-found: error
 
-      - name: Render maps
+  assemble:
+    needs: [check, render]
+    if: needs.check.outputs.needs_render == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: System libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libeccodes-dev libgeos-dev libproj-dev
+      - run: pip install -r requirements.txt
+      - name: Cache Natural Earth shapefiles
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/cartopy
+          key: natural-earth-50m-v1
+      - name: Collect rendered slices
+        uses: actions/download-artifact@v4
+        with:
+          pattern: images-*
+          path: site/images
+          merge-multiple: true
+      - name: Write manifest
         env:
-          RUN: ${{ github.event.inputs.run }}
           HOURS: ${{ github.event.inputs.hours }}
         run: |
-          ARGS="--workers 4"
+          ARGS="--manifest-only --run ${{ needs.check.outputs.run }}"
           if [ -n "$HOURS" ]; then ARGS="$ARGS --hours $HOURS"; fi
-          if [ -n "$RUN" ]; then ARGS="$ARGS --run $RUN"; fi
           python render/render.py $ARGS
-
-
-
-      - name: Upload site
-        uses: actions/upload-pages-artifact@v3
+          find site/images -name '*.png' | wc -l
+      - uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
   deploy:
-    needs: render
+    needs: assemble
     runs-on: ubuntu-latest
     environment:
       name: github-pages
