@@ -7,6 +7,10 @@ Render GFS maps for the site.
     python render/render.py --hours 0-48/6 --regions conus natl --params z500_vort mslp_precip
     python render/render.py --synthetic          # no network: fake fields, for testing plots
 
+CI helpers (used by the GitHub Actions workflow):
+    python render/check.py                       # newest run vs. what's live; writes job outputs
+    python render/render.py --manifest-only --run 2026090612   # write manifest for already-rendered images
+
 Output:
     site/images/gfs/<run>/<region>/<param>/f<hhh>.png
     site/manifest.json
@@ -17,6 +21,7 @@ import argparse
 import datetime as dt
 import json
 import logging
+import os
 import shutil
 import sys
 import tempfile
@@ -142,6 +147,7 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--synthetic", action="store_true", help="fake data, no network")
     ap.add_argument("--keep-grib", action="store_true")
+    ap.add_argument("--manifest-only", action="store_true", help="write manifest for images already in site/")
     args = ap.parse_args()
 
     hours = parse_hours(args.hours) if args.hours else FORECAST_HOURS
@@ -160,6 +166,18 @@ def main():
              MODEL["name"], run_id, len(hours), len(args.regions), len(args.params))
 
     out_dir = SITE / "images" / MODEL["id"] / run_id
+
+    if args.manifest_only:
+        # only list hours that actually have images, so a failed slice doesn't leave 404 frames
+        have = sorted({int(p.stem[1:]) for p in out_dir.rglob("f*.png")}) if out_dir.exists() else []
+        hours = [h for h in hours if h in have] or hours
+        manifest = write_manifest(run_id, hours, args.regions, args.params)
+        if storage.enabled():
+            storage.put_json(manifest, "manifest.json")
+        prune_runs([r["id"] for r in manifest["model"]["runs"]])
+        log.info("manifest written: %d hours", len(hours))
+        return
+
     grib_dir = Path(tempfile.mkdtemp(prefix="wx_grib_")) if not args.keep_grib else ROOT / "grib" / run_id
     pairs = all_fetch_pairs(args.params)
 

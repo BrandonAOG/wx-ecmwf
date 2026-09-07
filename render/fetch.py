@@ -19,6 +19,9 @@ import requests
 from config import (MODEL, NOMADS_DIR, NOMADS_FILE, NOMADS_FILTER, NOMADS_IDX,
                     PARAMS)
 
+# ECMWF open data file layout (one GRIB2 per step, all params)
+ECMWF_FILE = "https://data.ecmwf.int/forecasts/{ymd}/{hh}z/ifs/0p25/oper/{ymd}{hh}0000-{step}h-oper-fc.grib2"
+
 log = logging.getLogger("fetch")
 
 # cfgrib short names for each (VAR, LEVEL) pair we ask NOMADS for.
@@ -56,16 +59,17 @@ def latest_available_run(now: dt.datetime | None = None,
     now = now or dt.datetime.now(dt.timezone.utc)
     session = session or requests.Session()
     if MODEL["source"] == "ecmwf_opendata":
-        from ecmwf.opendata import Client
-        c = Client(source="ecmwf", model="ifs", resol="0p25")
+        # A run is complete when its last step's file exists on the open-data server.
+        last = MODEL["hours"][-1]
         for cand in _candidate_cycles(now):
+            url = ECMWF_FILE.format(ymd=cand.strftime("%Y%m%d"), hh=cand.strftime("%H"), step=last)
             try:
-                # asks for the last step: if it exists the run is complete
-                c.latest(date=cand.strftime("%Y%m%d"), time=cand.hour, type="fc", stream="oper",
-                         step=MODEL["hours"][-1], param="msl")
-                return cand
-            except Exception as e:  # noqa: BLE001
-                log.info("ECMWF %s not complete yet (%s)", cand.strftime("%Y%m%d %HZ"), type(e).__name__)
+                r = session.head(url, timeout=30, allow_redirects=True)
+                if r.status_code == 200:
+                    return cand
+                log.info("ECMWF %s not complete yet (HTTP %s)", cand.strftime("%Y%m%d %HZ"), r.status_code)
+            except requests.RequestException as e:
+                log.warning("HEAD %s failed: %s", url, e)
         raise RuntimeError("No complete ECMWF run found in the last 48 h")
     for cand in _candidate_cycles(now):
         url = NOMADS_IDX.format(ymd=cand.strftime("%Y%m%d"), hh=cand.strftime("%H"))
