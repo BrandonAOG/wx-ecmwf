@@ -15,6 +15,7 @@ import cartopy.feature as cfeature
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.colors as mcolors
+import matplotlib.patches
 import matplotlib.patheffects
 import matplotlib.pyplot as plt
 import matplotlib.ticker
@@ -136,12 +137,13 @@ def plot_z500_vort(f, meta):
     z = smooth(pick(f, "gh500") / 10)           # dam
     vort = pick(f, "absv500", "absv") * 1e5     # 1e-5 s^-1
     levels = np.arange(8, 60, 2)
-    cmap = plt.get_cmap("YlOrRd")
-    cf = ax.contourf(lon, lat, vort, levels=levels, cmap=cmap, extend="max", transform=PC, zorder=2)
+    cf = ax.contourf(lon, lat, vort, levels=levels, cmap=VORT_CMAP, extend="max", transform=PC, zorder=2)
     contour_labeled(ax, lon, lat, z, np.arange(480, 620, 6), "black", 1.0)
+    if "u500" in f:
+        barbs(ax, lon, lat, pick(f, "u500") * 1.944, pick(f, "v500") * 1.944, color="#333")
     add_basemap(ax)
     colorbar(fig, cf, "Absolute vorticity (10⁻⁵ s⁻¹)", ticks=levels[::2])
-    title(fig, ax, meta, "500 hPa height (dam) & absolute vorticity")
+    title(fig, ax, meta, "500 mb height (dam), absolute vorticity & wind (kt)")
     return fig
 
 
@@ -157,8 +159,8 @@ def plot_mslp_precip(f, meta):
     lon, lat = f.lon, f.lat
     mslp = smooth(pick(f, "prmsl") / 100)
     cmap, norm, bounds = _precip_cmap()
-    if "tp" in f:
-        precip_in = pick(f, "tp") / 25.4
+    if "tp_6" in f:
+        precip_in = pick(f, "tp_6") / 25.4
         cf = ax.pcolormesh(lon, lat, np.ma.masked_less(precip_in, 0.01), cmap=cmap, norm=norm,
                            transform=PC, zorder=2, shading="auto")
         colorbar(fig, cf, "6-hr precipitation (in)", ticks=bounds)
@@ -176,7 +178,7 @@ def plot_mslp_precip(f, meta):
     contour_labeled(ax, lon, lat, mslp, np.arange(940, 1060, 4), "black", 1.0)
     hilo(ax, lon, lat, mslp)
     add_basemap(ax)
-    title(fig, ax, meta, "MSLP (hPa), 1000–500 hPa thickness (dam) & 6-hr precipitation")
+    title(fig, ax, meta, "MSLP (mb), 1000–500 mb thickness (dam) & 6-hr precipitation (in)")
     return fig
 
 
@@ -187,12 +189,12 @@ def plot_t850_wind(f, meta):
     levels = np.arange(-30, 36, 2)
     cf = ax.contourf(lon, lat, t, levels=levels, cmap="RdYlBu_r", extend="both", transform=PC, zorder=2)
     ax.contour(lon, lat, t, levels=[0], colors="k", linewidths=1.2, linestyles="dashed", transform=PC, zorder=4)
-    if "gh850" in f:
-        contour_labeled(ax, lon, lat, smooth(pick(f, "gh850") / 10), np.arange(100, 180, 3), "black", 0.8)
+    if "prmsl" in f:
+        contour_labeled(ax, lon, lat, smooth(pick(f, "prmsl") / 100), np.arange(940, 1060, 4), "black", 0.8)
     barbs(ax, lon, lat, pick(f, "u850") * 1.944, pick(f, "v850") * 1.944, color="#222")
     add_basemap(ax)
-    colorbar(fig, cf, "850 hPa temperature (°C)", ticks=levels[::3])
-    title(fig, ax, meta, "850 hPa temperature (°C), height (dam) & wind (kt)")
+    colorbar(fig, cf, "850 mb temperature (°C)", ticks=levels[::3])
+    title(fig, ax, meta, "850 mb temperature (°C), wind (kt) & MSLP (mb)")
     return fig
 
 
@@ -207,7 +209,7 @@ def plot_t2m(f, meta):
         contour_labeled(ax, lon, lat, smooth(pick(f, "prmsl") / 100), np.arange(940, 1060, 4), "#333", 0.6)
     add_basemap(ax)
     colorbar(fig, cf, "2 m temperature (°F)", ticks=levels[::2])
-    title(fig, ax, meta, "2 m temperature (°F) & MSLP (hPa)")
+    title(fig, ax, meta, "2 m temperature (°F) & MSLP (mb)")
     return fig
 
 
@@ -231,7 +233,7 @@ def plot_wind10m(f, meta):
         hilo(ax, lon, lat, mslp)
     add_basemap(ax)
     colorbar(fig, cf, "10 m wind speed (kt)", ticks=bounds)
-    title(fig, ax, meta, "10 m wind (kt) & MSLP (hPa)")
+    title(fig, ax, meta, "MSLP (mb) & 10 m wind (kt)")
     return fig
 
 
@@ -246,7 +248,7 @@ def plot_pwat(f, meta):
         contour_labeled(ax, lon, lat, smooth(pick(f, "prmsl") / 100), np.arange(940, 1060, 4), "white", 0.7)
     add_basemap(ax)
     colorbar(fig, cf, "Precipitable water (mm)", ticks=levels[::4])
-    title(fig, ax, meta, "Precipitable water (mm) & MSLP (hPa)")
+    title(fig, ax, meta, "MSLP (mb) & precipitable water (mm)")
     return fig
 
 
@@ -261,9 +263,420 @@ def plot_cape(f, meta):
     norm = mcolors.BoundaryNorm(bounds, len(colors))
     cf = ax.pcolormesh(lon, lat, np.ma.masked_less(cape, 100), cmap=cmap, norm=norm,
                        transform=PC, zorder=2, shading="auto")
-    if "u10" in f:
-        barbs(ax, lon, lat, pick(f, "u10") * 1.944, pick(f, "v10") * 1.944, color="#333")
+    if "u850" in f:
+        barbs(ax, lon, lat, pick(f, "u850") * 1.944, pick(f, "v850") * 1.944, color="#c81e1e")
+    if "u500" in f:
+        barbs(ax, lon, lat, pick(f, "u500") * 1.944, pick(f, "v500") * 1.944, color="#1848a8")
     add_basemap(ax)
     colorbar(fig, cf, "Surface-based CAPE (J/kg)", ticks=bounds)
-    title(fig, ax, meta, "Surface-based CAPE (J/kg) & 10 m wind (kt)")
+    title(fig, ax, meta, "Surface-based CAPE (J/kg), 850 mb (red) & 500 mb (blue) wind (kt)")
+    return fig
+
+
+# ---------------------------------------------------- colour tables ---------
+
+VORT_CMAP = mcolors.LinearSegmentedColormap.from_list(
+    "vort", ["#ffffff", "#fff5c2", "#fed976", "#feb24c", "#fd8d3c", "#f03b20", "#bd0026", "#7a0177", "#3f007d"])
+
+# NWS-style reflectivity, 5 dBZ steps 5..75
+REFC_BOUNDS = np.arange(5, 80, 5)
+REFC_RAIN = mcolors.ListedColormap(["#04e9e7", "#019ff4", "#0300f4", "#02fd02", "#01c501", "#008e00", "#fdf802",
+                                    "#e5bc00", "#fd9500", "#fd0000", "#d40000", "#bc0000", "#f800fd", "#9854c6"])
+REFC_SNOW = mcolors.ListedColormap(["#e3ecf7", "#c4d6ee", "#a5c0e6", "#87aadd", "#6894d4", "#4a7ecb", "#2b68c2",
+                                    "#1f53a6", "#173e8a", "#10296d", "#3a1f7a", "#5c2d91", "#7f3aa8", "#a247bf"])
+REFC_ICE = mcolors.ListedColormap(["#f7e3f2", "#efc6e5", "#e7a9d8", "#df8ccb", "#d76fbe", "#cf52b1", "#c735a4",
+                                   "#ad2b8f", "#93227a", "#791965", "#601050", "#46073b", "#33052b", "#20031b"])
+REFC_FRZR = mcolors.ListedColormap(["#ffe6e6", "#ffcccc", "#ffb3b3", "#ff9999", "#ff8080", "#ff6666", "#ff4d4d",
+                                    "#ff3333", "#ff1a1a", "#ff0000", "#e60000", "#cc0000", "#b30000", "#990000"])
+
+SNOW_BOUNDS = [0.1, 1, 2, 3, 4, 6, 8, 12, 18, 24, 30, 36, 48]
+SNOW_CMAP = mcolors.ListedColormap(["#e0f3ff", "#b8e2ff", "#8ecbff", "#5ba8f5", "#2d7fe0", "#1f5fc4", "#3b2ea8",
+                                    "#6b2d9e", "#9b3aa0", "#c74ba0", "#e06aa9", "#f090c0"])
+PRECIP_BIG_BOUNDS = [0.01, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 6, 8, 10, 15, 20]
+PRECIP_BIG_CMAP = mcolors.ListedColormap(["#d9f0f7", "#a6dcee", "#66c2e0", "#2e9fd0", "#1f6fb5", "#3ec24d", "#1e8f2a",
+                                          "#0f5c1a", "#f7e530", "#f7a020", "#ea3b1a", "#b41313", "#7a0f5e", "#4b0a3f",
+                                          "#2a0524"])
+
+
+# ---------------------------------------------------- diagnostics helpers ---
+
+R_EARTH = 6.371e6
+
+
+def grid_spacing(lon, lat):
+    """dx, dy in metres as 2-D arrays for a regular lat/lon grid."""
+    LON, LAT = np.meshgrid(lon, lat)
+    dlon = np.gradient(LON, axis=1)
+    dlat = np.gradient(LAT, axis=0)
+    dx = np.radians(dlon) * R_EARTH * np.cos(np.radians(LAT))
+    dy = np.radians(dlat) * R_EARTH
+    return dx, dy
+
+
+def ddx(a, dx):
+    return np.gradient(a, axis=1) / dx
+
+
+def ddy(a, dy):
+    return np.gradient(a, axis=0) / dy
+
+
+def rel_vort(u, v, lon, lat):
+    dx, dy = grid_spacing(lon, lat)
+    return ddx(v, dx) - ddy(u, dy)
+
+
+def temp_advection(t, u, v, lon, lat):
+    """-(V·∇T) in K/hr"""
+    dx, dy = grid_spacing(lon, lat)
+    return -(u * ddx(t, dx) + v * ddy(t, dy)) * 3600
+
+
+def frontogenesis(t, u, v, lon, lat):
+    """Petterssen 2-D frontogenesis in K / 100 km / 3 hr (positive = frontogenetic)."""
+    dx, dy = grid_spacing(lon, lat)
+    tx, ty = ddx(t, dx), ddy(t, dy)
+    mag = np.hypot(tx, ty) + 1e-12
+    ux, uy, vx, vy = ddx(u, dx), ddy(u, dy), ddx(v, dx), ddy(v, dy)
+    F = -(tx ** 2 * ux + tx * ty * (vx + uy) + ty ** 2 * vy) / mag
+    return F * 1e5 * 3 * 3600
+
+
+def okubo_weiss(u, v, lon, lat):
+    dx, dy = grid_spacing(lon, lat)
+    ux, uy, vx, vy = ddx(u, dx), ddy(u, dy), ddx(v, dx), ddy(v, dy)
+    s_n = ux - vy                  # normal strain
+    s_s = vx + uy                  # shear strain
+    omega = vx - uy                # vorticity
+    ow = s_n ** 2 + s_s ** 2 - omega ** 2
+    axis = 0.5 * np.arctan2(s_s, s_n)   # dilatation axis angle
+    return ow, axis, np.hypot(s_n, s_s)
+
+
+def mslp_contours(ax, f, color="black", lw=0.9, labels=True):
+    if "prmsl" not in f:
+        return None
+    m = smooth(f["prmsl"] / 100)
+    if labels:
+        return contour_labeled(ax, f.lon, f.lat, m, np.arange(940, 1060, 4), color, lw)
+    return ax.contour(f.lon, f.lat, m, levels=np.arange(940, 1060, 4), colors=color, linewidths=lw, transform=PC, zorder=6)
+
+
+def ptype_masks(f):
+    """Boolean masks for snow / sleet / freezing rain / rain from categorical fields."""
+    z = np.zeros_like(next(iter(f.values())), dtype=bool)
+    snow = f.get("csnow", z) > 0.5
+    ice = (f.get("cicep", z) > 0.5) & ~snow
+    frzr = (f.get("cfrzr", z) > 0.5) & ~snow & ~ice
+    rain = ~(snow | ice | frzr)
+    return snow, ice, frzr, rain
+
+
+def ptype_legend(fig):
+    handles = [matplotlib.patches.Patch(color=c, label=l) for c, l in
+               [("#1e8f2a", "Rain"), ("#2b68c2", "Snow"), ("#cf52b1", "Sleet"), ("#ff4d4d", "Freezing rain")]]
+    fig.legend(handles=handles, loc="lower right", bbox_to_anchor=(0.99, 0.035), ncol=4, fontsize=8, frameon=False)
+
+
+# ---------------------------------------------------- precipitation ---------
+
+def plot_mslp_ptype(f, meta):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    if "tp_6" in f:
+        p = pick(f, "tp_6") / 25.4
+        bounds = [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6]
+        snow, ice, frzr, rain = ptype_masks(f)
+        for mask, cmap in [(rain, plt.get_cmap("Greens")), (snow, plt.get_cmap("Blues")),
+                           (ice, plt.get_cmap("Purples")), (frzr, plt.get_cmap("Reds"))]:
+            cm = mcolors.ListedColormap(cmap(np.linspace(0.25, 1, len(bounds) - 1)))
+            norm = mcolors.BoundaryNorm(bounds, cm.N)
+            ax.pcolormesh(lon, lat, np.ma.masked_where(~mask | (p < 0.01), p), cmap=cm, norm=norm,
+                          transform=PC, zorder=2, shading="auto")
+        cf = ax.pcolormesh(lon, lat, np.ma.masked_all(p.shape), cmap=mcolors.ListedColormap(plt.get_cmap("Greens")(np.linspace(0.25, 1, len(bounds) - 1))),
+                           norm=mcolors.BoundaryNorm(bounds, len(bounds) - 1), transform=PC, zorder=1, shading="auto")
+        colorbar(fig, cf, "6-hr precipitation (in) — colour = type", ticks=bounds)
+        ptype_legend(fig)
+    else:
+        ax.text(0.5, 0.5, "No accumulated precipitation at hour 000", transform=ax.transAxes, ha="center", fontsize=11, color="#666", zorder=9)
+    mslp_contours(ax, f)
+    if "prmsl" in f:
+        hilo(ax, lon, lat, smooth(f["prmsl"] / 100))
+    add_basemap(ax)
+    title(fig, ax, meta, "MSLP (mb) & 6-hr precipitation by type (in)")
+    return fig
+
+
+def plot_refc(f, meta):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    refc = pick(f, "refc")
+    snow, ice, frzr, rain = ptype_masks(f)
+    norm = mcolors.BoundaryNorm(REFC_BOUNDS, 14)
+    for mask, cmap in [(rain, REFC_RAIN), (snow, REFC_SNOW), (ice, REFC_ICE), (frzr, REFC_FRZR)]:
+        ax.pcolormesh(lon, lat, np.ma.masked_where(~mask | (refc < 5), refc), cmap=cmap, norm=norm,
+                      transform=PC, zorder=2, shading="auto")
+    cf = ax.pcolormesh(lon, lat, np.ma.masked_all(refc.shape), cmap=REFC_RAIN, norm=norm, transform=PC, zorder=1, shading="auto")
+    mslp_contours(ax, f, lw=0.7)
+    add_basemap(ax)
+    colorbar(fig, cf, "Composite reflectivity (dBZ) — rain scale; snow blue, sleet purple, freezing rain red", ticks=REFC_BOUNDS[::2])
+    ptype_legend(fig)
+    title(fig, ax, meta, "Simulated composite reflectivity (dBZ) & MSLP (mb)")
+    return fig
+
+
+def _accum_plot(f, meta, key, label, title_txt):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    if key in f:
+        p = f[key] / 25.4
+        norm = mcolors.BoundaryNorm(PRECIP_BIG_BOUNDS, PRECIP_BIG_CMAP.N)
+        cf = ax.pcolormesh(lon, lat, np.ma.masked_less(p, 0.01), cmap=PRECIP_BIG_CMAP, norm=norm, transform=PC, zorder=2, shading="auto")
+        colorbar(fig, cf, label, ticks=PRECIP_BIG_BOUNDS)
+    else:
+        ax.text(0.5, 0.5, "Not available at this hour", transform=ax.transAxes, ha="center", fontsize=11, color="#666", zorder=9)
+    mslp_contours(ax, f, lw=0.7)
+    add_basemap(ax)
+    title(fig, ax, meta, title_txt)
+    return fig
+
+
+def plot_precip24(f, meta):
+    return _accum_plot(f, meta, "tp_24", "24-hr precipitation (in)", "24-hr accumulated precipitation (in) & MSLP (mb)")
+
+
+def plot_precip_total(f, meta):
+    return _accum_plot(f, meta, "tp_acc", "Total precipitation since hour 0 (in)", "Total accumulated precipitation (in) & MSLP (mb)")
+
+
+def plot_snow24(f, meta):
+    """10:1 snowfall from the four 6-h buckets ending now, counting only buckets flagged as snow."""
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    total = None
+    for tag in ("", "_m6", "_m12", "_m18"):
+        if f"tp_6{tag}" in f and f"csnow{tag}" in f:
+            contrib = f[f"tp_6{tag}"] * (f[f"csnow{tag}"] > 0.5)
+            total = contrib if total is None else total + contrib
+    if total is not None:
+        inches = total / 25.4 * 10
+        norm = mcolors.BoundaryNorm(SNOW_BOUNDS, SNOW_CMAP.N)
+        cf = ax.pcolormesh(lon, lat, np.ma.masked_less(inches, 0.1), cmap=SNOW_CMAP, norm=norm, transform=PC, zorder=2, shading="auto")
+        colorbar(fig, cf, "24-hr snowfall, 10:1 ratio (in)", ticks=SNOW_BOUNDS)
+    else:
+        ax.text(0.5, 0.5, "Not available at this hour", transform=ax.transAxes, ha="center", fontsize=11, color="#666", zorder=9)
+    mslp_contours(ax, f, lw=0.7)
+    add_basemap(ax)
+    title(fig, ax, meta, "24-hr snowfall, 10:1 ratio (in) & MSLP (mb)")
+    return fig
+
+
+def _snod_change(f, meta, other, label, title_txt):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    if "snod" in f and other in f:
+        change = (f["snod"] - f[other]) * 39.37
+        norm = mcolors.BoundaryNorm(SNOW_BOUNDS, SNOW_CMAP.N)
+        cf = ax.pcolormesh(lon, lat, np.ma.masked_less(change, 0.1), cmap=SNOW_CMAP, norm=norm, transform=PC, zorder=2, shading="auto")
+        colorbar(fig, cf, label, ticks=SNOW_BOUNDS)
+    else:
+        ax.text(0.5, 0.5, "Not available at this hour", transform=ax.transAxes, ha="center", fontsize=11, color="#666", zorder=9)
+    mslp_contours(ax, f, lw=0.7)
+    add_basemap(ax)
+    title(fig, ax, meta, title_txt)
+    return fig
+
+
+def plot_snod_total(f, meta):
+    return _snod_change(f, meta, "snod_f0", "Positive snow-depth change since hour 0 (in)", "Total positive snow-depth change (in) & MSLP (mb)")
+
+
+def plot_snod24(f, meta):
+    return _snod_change(f, meta, "snod_m24", "24-hr positive snow-depth change (in)", "24-hr positive snow-depth change (in) & MSLP (mb)")
+
+
+def plot_rh700_300(f, meta):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    rh = np.mean([pick(f, "r700"), pick(f, "r500"), pick(f, "r300")], axis=0)
+    levels = np.arange(0, 101, 10)
+    cf = ax.contourf(lon, lat, rh, levels=levels, cmap="BrBG", transform=PC, zorder=2)
+    if "gh500" in f:
+        contour_labeled(ax, lon, lat, smooth(f["gh500"] / 10), np.arange(480, 620, 6), "black", 0.8)
+    add_basemap(ax)
+    colorbar(fig, cf, "700–300 mb mean relative humidity (%)", ticks=levels)
+    title(fig, ax, meta, "700–300 mb mean relative humidity (%) & 500 mb height (dam)")
+    return fig
+
+
+# ---------------------------------------------------- upper dynamics --------
+
+def plot_z500_mslp(f, meta):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    z = smooth(pick(f, "gh500") / 10)
+    levels = np.arange(492, 600, 3)
+    cf = ax.contourf(lon, lat, z, levels=levels, cmap="turbo", extend="both", transform=PC, zorder=2)
+    ax.contour(lon, lat, z, levels=np.arange(480, 620, 6), colors="black", linewidths=0.7, transform=PC, zorder=4)
+    mslp_contours(ax, f, color="white", lw=1.0)
+    add_basemap(ax)
+    colorbar(fig, cf, "500 mb height (dam)", ticks=levels[::4])
+    title(fig, ax, meta, "500 mb height (dam) & MSLP (mb, white)")
+    return fig
+
+
+def _vort_level(f, meta, lev, zlevels):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    u, v = pick(f, f"u{lev}"), pick(f, f"v{lev}")
+    vort = smooth(rel_vort(u, v, lon, lat), 1.0) * 1e5
+    levels = np.arange(4, 44, 2)
+    cf = ax.contourf(lon, lat, vort, levels=levels, cmap=VORT_CMAP, extend="max", transform=PC, zorder=2)
+    contour_labeled(ax, lon, lat, smooth(pick(f, f"gh{lev}") / 10), zlevels, "black", 0.9)
+    barbs(ax, lon, lat, u * 1.944, v * 1.944, color="#333")
+    add_basemap(ax)
+    colorbar(fig, cf, f"{lev} mb relative vorticity (10⁻⁵ s⁻¹)", ticks=levels[::2])
+    title(fig, ax, meta, f"{lev} mb height (dam), relative vorticity & wind (kt)")
+    return fig
+
+
+def plot_z700_vort(f, meta):
+    return _vort_level(f, meta, 700, np.arange(270, 330, 3))
+
+
+def plot_z850_vort(f, meta):
+    return _vort_level(f, meta, 850, np.arange(100, 180, 3))
+
+
+def plot_z850_wind(f, meta):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    u, v = pick(f, "u850") * 1.944, pick(f, "v850") * 1.944
+    spd = np.hypot(u, v)
+    bounds = [20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100, 120]
+    cmap = plt.get_cmap("plasma_r", len(bounds) - 1)
+    norm = mcolors.BoundaryNorm(bounds, cmap.N)
+    cf = ax.pcolormesh(lon, lat, np.ma.masked_less(spd, 20), cmap=cmap, norm=norm, transform=PC, zorder=2, shading="auto")
+    contour_labeled(ax, lon, lat, smooth(pick(f, "gh850") / 10), np.arange(100, 180, 3), "black", 0.9)
+    barbs(ax, lon, lat, u, v, color="#333")
+    add_basemap(ax)
+    colorbar(fig, cf, "850 mb wind speed (kt)", ticks=bounds)
+    title(fig, ax, meta, "850 mb height (dam) & wind (kt)")
+    return fig
+
+
+def plot_wind250(f, meta):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    u, v = pick(f, "u250") * 1.944, pick(f, "v250") * 1.944
+    spd = np.hypot(u, v)
+    bounds = [50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 160, 180, 200]
+    cmap = plt.get_cmap("viridis", len(bounds) - 1)
+    norm = mcolors.BoundaryNorm(bounds, cmap.N)
+    cf = ax.pcolormesh(lon, lat, np.ma.masked_less(spd, 50), cmap=cmap, norm=norm, transform=PC, zorder=2, shading="auto")
+    contour_labeled(ax, lon, lat, smooth(pick(f, "gh250") / 10), np.arange(960, 1140, 12), "black", 0.9)
+    barbs(ax, lon, lat, u, v, color="#333")
+    add_basemap(ax)
+    colorbar(fig, cf, "250 mb wind speed (kt)", ticks=bounds)
+    title(fig, ax, meta, "250 mb wind (kt) & height (dam)")
+    return fig
+
+
+def plot_pv2(f, meta):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    p = pick(f, "pres_pv") / 100
+    levels = np.arange(100, 725, 25)
+    cf = ax.contourf(lon, lat, p, levels=levels, cmap="nipy_spectral_r", extend="both", transform=PC, zorder=2)
+    if "u_pv" in f:
+        barbs(ax, lon, lat, pick(f, "u_pv") * 1.944, pick(f, "v_pv") * 1.944, color="#111")
+    add_basemap(ax)
+    colorbar(fig, cf, "Pressure on the 2 PVU surface (mb)", ticks=levels[::4])
+    title(fig, ax, meta, "Dynamic tropopause: 2 PVU pressure (mb) & wind (kt)")
+    return fig
+
+
+def plot_sim_ir(f, meta):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    tb = pick(f, "sbt124") - 273.15
+    # classic IR enhancement: greys for warm scenes, colours for cold cloud tops
+    colors = ["#ffffff", "#ff00ff", "#0000ff", "#00ffff", "#00ff00", "#ffff00", "#ff8000", "#ff0000", "#600000"]
+    cold = mcolors.LinearSegmentedColormap.from_list("ir_cold", colors[::-1])
+    grey = plt.get_cmap("gray_r")
+    warm = ax.contourf(lon, lat, tb, levels=np.arange(-30, 41, 2), cmap=grey, extend="max", transform=PC, zorder=2)
+    cf = ax.contourf(lon, lat, np.ma.masked_greater(tb, -30), levels=np.arange(-90, -29, 3), cmap=cold, transform=PC, zorder=3)
+    mslp_contours(ax, f, color="#ffd400", lw=0.6, labels=False)
+    add_basemap(ax)
+    cb = colorbar(fig, cf, "Simulated IR brightness temperature (°C); greys −30 to +40", ticks=np.arange(-90, -29, 12))
+    title(fig, ax, meta, "Simulated IR satellite (10.7 µm) & MSLP (mb)")
+    return fig
+
+
+# ---------------------------------------------------- thermodynamics --------
+
+def plot_t700_wind(f, meta):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    t = pick(f, "t700") - 273.15
+    levels = np.arange(-40, 26, 2)
+    cf = ax.contourf(lon, lat, t, levels=levels, cmap="RdYlBu_r", extend="both", transform=PC, zorder=2)
+    ax.contour(lon, lat, t, levels=[0], colors="k", linewidths=1.2, linestyles="dashed", transform=PC, zorder=4)
+    mslp_contours(ax, f, lw=0.8)
+    barbs(ax, lon, lat, pick(f, "u700") * 1.944, pick(f, "v700") * 1.944, color="#222")
+    add_basemap(ax)
+    colorbar(fig, cf, "700 mb temperature (°C)", ticks=levels[::3])
+    title(fig, ax, meta, "700 mb temperature (°C), wind (kt) & MSLP (mb)")
+    return fig
+
+
+# ---------------------------------------------------- diagnostics -----------
+
+def _fgen(f, meta, lev, zlevels):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    t, u, v = pick(f, f"t{lev}"), pick(f, f"u{lev}"), pick(f, f"v{lev}")
+    adv = smooth(temp_advection(t, u, v, lon, lat), 1.2)
+    fg = smooth(frontogenesis(t, u, v, lon, lat), 1.5)
+    levels = np.arange(-3, 3.25, 0.25)
+    cf = ax.contourf(lon, lat, adv, levels=levels, cmap="RdBu_r", extend="both", transform=PC, zorder=2)
+    ax.contour(lon, lat, fg, levels=[1, 2, 4, 8, 16], colors="#7a0177", linewidths=[0.7, 0.9, 1.1, 1.3, 1.5], transform=PC, zorder=5)
+    contour_labeled(ax, lon, lat, smooth(pick(f, f"gh{lev}") / 10), zlevels, "black", 0.7)
+    add_basemap(ax)
+    colorbar(fig, cf, f"{lev} mb temperature advection (°C/hr); purple = frontogenesis 1,2,4,8,16 K/100km/3hr", ticks=levels[::4])
+    title(fig, ax, meta, f"{lev} mb temperature advection & Petterssen frontogenesis")
+    return fig
+
+
+def plot_fgen700(f, meta):
+    return _fgen(f, meta, 700, np.arange(270, 330, 3))
+
+
+def plot_fgen850(f, meta):
+    return _fgen(f, meta, 850, np.arange(100, 180, 3))
+
+
+def plot_okubo850(f, meta):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    u, v = pick(f, "u850"), pick(f, "v850")
+    ow, axis, strain = okubo_weiss(smooth(u, 1.0), smooth(v, 1.0), lon, lat)
+    ow = smooth(ow, 1.0) * 1e9
+    levels = np.arange(-20, 0.1, 2)
+    cf = ax.contourf(lon, lat, np.ma.masked_greater(ow, -0.5), levels=levels, cmap="YlOrRd_r", extend="min", transform=PC, zorder=2)
+    # dilatation axes: short segments where strain is meaningful
+    every = max(1, len(lon) // 34)
+    LON, LAT = np.meshgrid(lon, lat)
+    sub = (slice(None, None, every), slice(None, None, every))
+    st = strain[sub]; ang = axis[sub]
+    L = 0.9 * (lon[every] - lon[0]) if len(lon) > every else 0.5
+    keep = st > np.nanpercentile(st, 60)
+    for x0, y0, a, k in zip(LON[sub].ravel(), LAT[sub].ravel(), ang.ravel(), keep.ravel()):
+        if k:
+            ax.plot([x0 - L * np.cos(a) / 2, x0 + L * np.cos(a) / 2], [y0 - L * np.sin(a) / 2, y0 + L * np.sin(a) / 2],
+                    color="#1848a8", lw=0.9, transform=PC, zorder=6)
+    contour_labeled(ax, lon, lat, smooth(pick(f, "gh850") / 10), np.arange(100, 180, 3), "black", 0.7)
+    add_basemap(ax)
+    colorbar(fig, cf, "Okubo-Weiss (10⁻⁹ s⁻²; negative = rotation-dominated) · blue segments = dilatation axes", ticks=levels[::2])
+    title(fig, ax, meta, "850 mb Okubo-Weiss parameter & dilatation axes")
     return fig

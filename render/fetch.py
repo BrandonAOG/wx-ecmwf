@@ -88,32 +88,53 @@ def all_fetch_pairs(param_ids: list[str]) -> set[tuple[str, str]]:
     return pairs
 
 
-def ecmwf_requests(param_ids: list[str], fhr: int) -> list[dict]:
-    """Open-data requests for one forecast hour: one for pressure-level fields,
-    one for single-level fields, plus tp at the previous step so 6-h precip
-    can be de-accumulated (open-data tp is accumulated from t=0)."""
-    pl, sfc = {}, set()
+def ecmwf_pairs(param_ids: list[str]) -> set[tuple]:
+    pairs: set[tuple] = set()
     for pid in param_ids:
-        for name, lev in (PARAMS[pid].get("ecmwf") or []):
-            if lev is None:
-                sfc.add(name)
-            else:
-                pl.setdefault(lev, set()).add(name)
-    reqs = []
-    for lev, names in pl.items():
-        reqs.append({"type": "fc", "stream": "oper", "step": fhr, "levtype": "pl",
-                     "levelist": lev, "param": sorted(names)})
+        pairs.update(PARAMS[pid].get("ecmwf") or [])
+    return pairs
+
+
+def prev_steps(param_ids: list[str]) -> dict:
+    """{offset: {"fetch": set(pairs), "ecmwf": set(pairs)}} merged across products.
+    offset is an int (hours back) or "f0"."""
+    out: dict = {}
+    for pid in param_ids:
+        spec = PARAMS[pid].get("prev")
+        if not spec:
+            continue
+        for off in spec["offsets"]:
+            slot = out.setdefault(off, {"fetch": set(), "ecmwf": set()})
+            slot["fetch"].update(spec.get("fetch", []))
+            slot["ecmwf"].update(spec.get("ecmwf", []))
+    return out
+
+
+def step_for(fhr: int, offset) -> int | None:
+    """Forecast step to fetch for a previous-step offset, or None if n/a."""
+    step = 0 if offset == "f0" else fhr - int(offset)
+    return step if 0 <= step < fhr else None
+
+
+def ecmwf_requests(pairs: set[tuple], step: int) -> list[dict]:
+    """Open-data requests for one step: one per pressure level, one for
+    single-level fields. tp doesn't exist at step 0."""
+    pl, sfc = {}, set()
+    for name, lev in pairs:
+        if lev is None:
+            sfc.add(name)
+        else:
+            pl.setdefault(lev, set()).add(name)
+    if step == 0:
+        sfc.discard("tp")
+    reqs = [{"type": "fc", "stream": "oper", "step": step, "levtype": "pl", "levelist": lev, "param": sorted(n)}
+            for lev, n in pl.items()]
     if sfc:
-        if "tp" in sfc and fhr == 0:
-            sfc.discard("tp")
-        if sfc:
-            reqs.append({"type": "fc", "stream": "oper", "step": fhr, "levtype": "sfc", "param": sorted(sfc)})
-        if "tp" in sfc and fhr >= 6:
-            reqs.append({"type": "fc", "stream": "oper", "step": fhr - 6, "levtype": "sfc", "param": ["tp"]})
+        reqs.append({"type": "fc", "stream": "oper", "step": step, "levtype": "sfc", "param": sorted(sfc)})
     return reqs
 
 
-def download_ecmwf(run: dt.datetime, fhr: int, param_ids: list[str], dest: Path, retries: int = 4) -> Path:
+def download_ecmwf(run: dt.datetime, step: int, pairs: set[tuple], dest: Path, retries: int = 4) -> Path:
     """Fetch all messages for one hour into a single GRIB file. The client uses
     the .index files to byte-range only the requested fields."""
     from ecmwf.opendata import Client
@@ -124,17 +145,20 @@ def download_ecmwf(run: dt.datetime, fhr: int, param_ids: list[str], dest: Path,
     tmp = dest.with_suffix(".part")
     for attempt in range(retries):
         try:
+            reqs = ecmwf_requests(pairs, step)
+            if not reqs:
+                raise RuntimeError("nothing to fetch")
             with open(tmp, "wb") as out:
-                for req in ecmwf_requests(param_ids, fhr):
+                for req in reqs:
                     part = dest.with_suffix(f".{len(req['param'])}_{req.get('levelist', 'sfc')}_{req['step']}.grib2")
                     client.retrieve(date=run.strftime("%Y%m%d"), time=run.hour, target=str(part), **req)
                     out.write(part.read_bytes()); part.unlink()
             tmp.rename(dest)
             return dest
         except Exception as e:  # noqa: BLE001
-            log.warning("ECMWF f%03d attempt %d failed: %s", fhr, attempt, e)
+            log.warning("ECMWF step %d attempt %d failed: %s", step, attempt, e)
             time.sleep(10 * (attempt + 1))
-    raise RuntimeError(f"Failed to download ECMWF f{fhr:03d}")
+    raise RuntimeError(f"Failed to download ECMWF step {step}")
 
 
 def build_filter_url(run: dt.datetime, fhr: int, pairs: set[tuple[str, str]],
@@ -182,48 +206,91 @@ class Fields(dict):
     lat: np.ndarray
 
 
-def load_grib(path: Path) -> Fields:
-    """Read every message in a GRIB2 file into a Fields dict keyed by cfgrib
-    short name (with the level appended when the same name occurs at several
-    levels, e.g. gh500 / gh850 / gh1000)."""
-    import cfgrib  # imported lazily so --synthetic mode works without eccodes
+# Names eccodes gives GFS/ECMWF fields at fixed heights -> the names plots.py uses
+HEIGHT_NAMES = {"2t": "t2m", "10u": "u10", "10v": "v10", "2r": "rh2m", "2d": "d2m", "10si": "si10"}
 
+
+def load_grib(path: Path, tag: str = "") -> Fields:
+    """Read every message in a GRIB file into Fields keyed so that plots can
+    tell fields apart unambiguously:
+
+        t850, u250, gh500, r700     isobaric: shortName + level (hPa)
+        t2m, u10, v10               fixed heights (renamed via HEIGHT_NAMES)
+        pres_pv, u_pv, v_pv         2-PVU surface
+        tp_acc                      accumulation from t=0
+        tp_6                        6-hour bucket (GFS)
+        refc, csnow, cape, ...      anything else: shortName
+        unknown ids                 p<paramId>
+
+    `tag` is appended to every key (e.g. "_m24" for fields fetched from
+    forecast hour fhr-24) so previous-step fields can live alongside."""
+    import eccodes as ec
     out = Fields()
-    datasets = cfgrib.open_datasets(str(path), backend_kwargs={"indexpath": ""})
-    lon = lat = None
-    for ds in datasets:
-        if lon is None:
-            lon = ds["longitude"].values
-            lat = ds["latitude"].values
-        for name, da in ds.data_vars.items():
-            arr = da.values
-            if "step" in da.dims and da.sizes["step"] == 2:      # tp at fhr-6 and fhr
-                out[f"{name}_prev"] = np.asarray(arr[0], dtype=float)
-                arr = arr[1]
-                da = da.isel(step=1)
-            # cfgrib may stack multiple levels in one variable
-            if "isobaricInhPa" in da.dims:
-                for i, lev in enumerate(da["isobaricInhPa"].values):
-                    out[f"{name}{int(lev)}"] = np.asarray(arr[i], dtype=float)
-            else:
-                lev = da.coords.get("isobaricInhPa")
-                key = f"{name}{int(lev.values)}" if lev is not None and lev.ndim == 0 else name
-                out[key] = np.asarray(arr, dtype=float)
-    if lon is None:
+    lat = lon = None
+    with open(path, "rb") as fh:
+        while True:
+            h = ec.codes_grib_new_from_file(fh)
+            if h is None:
+                break
+            try:
+                name = ec.codes_get(h, "shortName")
+                if name in ("unknown", "~", ""):
+                    name = f"p{ec.codes_get(h, 'paramId')}"
+                tol = ec.codes_get(h, "typeOfLevel")
+                lev = ec.codes_get(h, "level")
+                step_type = ec.codes_get(h, "stepType")
+                if tol == "isobaricInhPa":
+                    key = f"{name}{int(lev)}"
+                elif tol == "potentialVorticity":
+                    key = f"{name}_pv"
+                elif tol in ("heightAboveGround", "heightAboveGroundLayer"):
+                    key = HEIGHT_NAMES.get(name, f"{name}{int(lev)}m" if name in ("t", "u", "v", "r", "q") else name)
+                else:
+                    key = name
+                if step_type == "accum":
+                    start = int(ec.codes_get(h, "startStep")); endstep = int(ec.codes_get(h, "endStep"))
+                    key += "_acc" if start == 0 else f"_{endstep - start}"
+                key += tag
+                ni, nj = ec.codes_get(h, "Ni"), ec.codes_get(h, "Nj")
+                vals = ec.codes_get_values(h).reshape(nj, ni)
+                if lat is None:
+                    lats = ec.codes_get_array(h, "latitudes").reshape(nj, ni)
+                    lons = ec.codes_get_array(h, "longitudes").reshape(nj, ni)
+                    lat, lon = lats[:, 0].copy(), lons[0, :].copy()
+                missing = ec.codes_get(h, "missingValue")
+                vals = np.where(vals == missing, np.nan, vals)
+                if key not in out:                 # first occurrence wins (e.g. duplicate tp records)
+                    out[key] = np.asarray(vals, dtype=float)
+            finally:
+                ec.codes_release(h)
+    if lat is None:
         raise RuntimeError(f"No data in {path}")
     lon = np.where(lon > 180, lon - 360, lon)
     order = np.argsort(lon)
     lon = lon[order]
     for k in list(out):
         out[k] = out[k][:, order]
+    if lat[0] < lat[-1]:                           # plots assume north-to-south rows
+        lat = lat[::-1]
+        for k in list(out):
+            out[k] = out[k][::-1, :]
     out.lon, out.lat = lon, lat
-    return normalise(out)
+    return out
 
 
-def normalise(f: "Fields") -> "Fields":
-    """Map model-specific names/units onto the names plots.py expects
-    (GFS/cfgrib conventions): prmsl [Pa], tp [mm per 6 h], absv500 [s^-1],
-    pwat [mm], t2m, u10, v10, t850..."""
+def merge(a: Fields, b: Fields) -> Fields:
+    """Merge previous-step fields (already tagged) into the main Fields."""
+    for k, v in b.items():
+        if v.shape == next(iter(a.values())).shape:
+            a[k] = v
+    return a
+
+
+def normalise(f: "Fields", fhr: int = 0) -> "Fields":
+    """Map model-specific names/units onto what plots.py expects:
+    prmsl [Pa], tp_6 [mm/6 h], tp_acc [mm since t0], absv500 [s^-1], pwat [mm],
+    t2m, u10, v10, t850 ... GFS is the reference convention."""
+    ecmwf = MODEL["source"] == "ecmwf_opendata"
     if "msl" in f and "prmsl" not in f:
         f["prmsl"] = f.pop("msl")
     if "tcwv" in f and "pwat" not in f:
@@ -231,9 +298,22 @@ def normalise(f: "Fields") -> "Fields":
     if "vo500" in f and "absv500" not in f:                      # relative -> absolute vorticity
         _, LAT = np.meshgrid(f.lon, f.lat)
         f["absv500"] = f["vo500"] + 2 * 7.2921e-5 * np.sin(np.radians(LAT))
-    if "tp" in f and MODEL["source"] == "ecmwf_opendata":         # m accumulated since t0 -> mm per 6 h
-        prev = f.pop("tp_prev", np.zeros_like(f["tp"]))
-        f["tp"] = np.clip(f["tp"] - prev, 0, None) * 1000.0
+    if ecmwf:                                                    # ECMWF tp is metres accumulated since t0
+        for k in [k for k in f if k.startswith("tp_acc")]:
+            f[k] = f[k] * 1000.0
+        if "tp_acc" in f:
+            prev = f.get("tp_acc_m6", np.zeros_like(f["tp_acc"]))
+            f["tp_6"] = np.clip(f["tp_acc"] - prev, 0, None)
+    # GFS: at f006 the only bucket is 0-6, keyed tp_acc. Same for tagged previous steps.
+    for tag in ("", "_m6", "_m12", "_m18"):
+        if f"tp_6{tag}" not in f and f"tp_acc{tag}" in f:
+            f[f"tp_6{tag}"] = f[f"tp_acc{tag}"]
+    for k in [k for k in f if k.startswith("tp_acc_m")]:         # 24-h totals
+        pass
+    if "tp_acc" in f and "tp_acc_m24" in f:
+        f["tp_24"] = np.clip(f["tp_acc"] - f["tp_acc_m24"], 0, None)
+    elif "tp_acc" in f and fhr <= 24:
+        f["tp_24"] = f["tp_acc"]
     return f
 
 
@@ -251,29 +331,42 @@ def crop(f: "Fields", bbox) -> "Fields":
     return out
 
 
-def synthetic_fields(fhr: int, bbox, n=(120, 200)) -> Fields:
-    """Fake but physically plausible-looking fields for testing the plots
-    without network access to NOMADS."""
+def synthetic_fields(fhr: int, bbox, n=(120, 200), tags=("", "_m6", "_m12", "_m18", "_m24", "_f0")) -> Fields:
+    """Fake but plausible-looking fields (with the same key scheme as
+    load_grib) for testing the plots without network access."""
     lon0, lon1, lat0, lat1 = bbox
     lat = np.linspace(lat1, lat0, n[0])
     lon = np.linspace(lon0, lon1, n[1])
     LON, LAT = np.meshgrid(lon, lat)
-    t = fhr / 24.0
-    wave = np.sin(np.radians(LON * 3 + t * 40)) * np.cos(np.radians((LAT - 35) * 4))
+    rng = np.random.default_rng(fhr)
     out = Fields()
     out.lon, out.lat = lon, lat
-    out["gh500"] = 5700 - 12 * (LAT - 25) + 120 * wave
-    out["gh850"] = 1500 - 4 * (LAT - 25) + 40 * wave
-    out["gh1000"] = 100 + 20 * wave
-    out["absv"] = (2e-5 + 1.5e-4 * np.clip(wave, 0, 1) ** 2 * np.sin(np.radians(LON * 6))**2)
-    out["prmsl"] = 101300 - 1200 * wave + 200 * np.cos(np.radians(LAT * 5))
-    out["tp"] = 15 * np.clip(-wave, 0, 1) ** 3 * (np.random.default_rng(fhr).random(LON.shape) * 0.5 + 0.5)
-    out["t850"] = 293 - 0.5 * (LAT - 10) + 5 * wave
-    out["u850"] = 10 * wave + 5
-    out["v850"] = 8 * np.cos(np.radians(LON * 3 + t * 40))
-    out["t2m"] = 303 - 0.7 * (LAT - 10) + 4 * wave
-    out["u10"] = 6 * wave + 3
-    out["v10"] = 5 * np.cos(np.radians(LON * 3 + t * 40))
-    out["pwat"] = 45 - 0.8 * (LAT - 10) + 12 * -wave
-    out["cape"] = 3000 * np.clip(-wave, 0, 1) ** 2 * np.clip((40 - LAT) / 30, 0, 1)
+    for tag in tags:
+        t = (fhr - {"": 0, "_m6": 6, "_m12": 12, "_m18": 18, "_m24": 24, "_f0": fhr}[tag]) / 24.0
+        wave = np.sin(np.radians(LON * 3 + t * 40)) * np.cos(np.radians((LAT - 35) * 4))
+        cold = np.clip((LAT - 30) / 25, 0, 1)
+        f = {
+            "gh500": 5700 - 12 * (LAT - 25) + 120 * wave, "gh700": 3000 - 7 * (LAT - 25) + 70 * wave,
+            "gh850": 1500 - 4 * (LAT - 25) + 40 * wave, "gh1000": 100 + 20 * wave, "gh250": 10600 - 22 * (LAT - 25) + 200 * wave,
+            "absv500": 2e-5 + 1.5e-4 * np.clip(wave, 0, 1) ** 2 * np.sin(np.radians(LON * 6)) ** 2,
+            "u500": 25 * wave + 15, "v500": 12 * np.cos(np.radians(LON * 3 + t * 40)),
+            "u700": 15 * wave + 8, "v700": 9 * np.cos(np.radians(LON * 3 + t * 40)),
+            "u850": 10 * wave + 5, "v850": 8 * np.cos(np.radians(LON * 3 + t * 40)),
+            "u250": 45 * wave + 25 + 20 * np.exp(-((LAT - 40) / 6) ** 2), "v250": 20 * np.cos(np.radians(LON * 3 + t * 40)),
+            "prmsl": 101300 - 1200 * wave + 200 * np.cos(np.radians(LAT * 5)),
+            "tp_6": 15 * np.clip(-wave, 0, 1) ** 3 * (rng.random(LON.shape) * 0.5 + 0.5),
+            "t850": 293 - 0.5 * (LAT - 10) + 5 * wave, "t700": 283 - 0.5 * (LAT - 10) + 5 * wave,
+            "t2m": 303 - 0.7 * (LAT - 10) + 4 * wave, "u10": 6 * wave + 3, "v10": 5 * np.cos(np.radians(LON * 3 + t * 40)),
+            "pwat": 45 - 0.8 * (LAT - 10) + 12 * -wave, "cape": 3000 * np.clip(-wave, 0, 1) ** 2 * np.clip((40 - LAT) / 30, 0, 1),
+            "r700": np.clip(60 - 40 * wave, 0, 100), "r500": np.clip(50 - 40 * wave, 0, 100), "r300": np.clip(40 - 40 * wave, 0, 100),
+            "refc": np.clip(55 * np.clip(-wave, 0, 1) ** 1.5 * (rng.random(LON.shape) * 0.6 + 0.4) - 5, -10, 70),
+            "csnow": (cold * np.clip(-wave, 0, 1) > 0.45).astype(float), "cicep": np.zeros_like(LAT),
+            "cfrzr": ((cold * np.clip(-wave, 0, 1) > 0.38) & (cold * np.clip(-wave, 0, 1) <= 0.45)).astype(float),
+            "pres_pv": 25000 + 20000 * cold + 15000 * wave, "u_pv": 40 * wave + 30, "v_pv": 20 * np.cos(np.radians(LON * 3 + t * 40)),
+            "sbt124": 290 - 70 * np.clip(-wave, 0, 1) ** 2 - 10 * cold, "snod": 0.05 * cold * (1 + t) * np.clip(-wave, 0, 1),
+        }
+        f["crain"] = ((f["tp_6"] > 0.2) & (f["csnow"] == 0) & (f["cfrzr"] == 0)).astype(float)
+        f["tp_acc"] = f["tp_6"] * max(1, (fhr / 6) * 0.6)
+        for k, v in f.items():
+            out[k + tag] = v
     return out

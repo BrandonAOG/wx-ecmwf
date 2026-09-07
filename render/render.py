@@ -35,9 +35,10 @@ import requests  # noqa: E402
 
 import plots  # noqa: E402
 import storage  # noqa: E402
-from config import (FORECAST_HOURS, KEEP_RUNS, MODEL, PARAMS, REGIONS)  # noqa: E402
-from fetch import (all_fetch_pairs, build_filter_url, crop, download, download_ecmwf,
-                   latest_available_run, load_grib, synthetic_fields)  # noqa: E402
+from config import (FORECAST_HOURS, KEEP_RUNS, MODEL, PARAMS, REGIONS, model_params, param_hours)  # noqa: E402
+from fetch import (all_fetch_pairs, build_filter_url, crop, download, download_ecmwf, ecmwf_pairs,
+                   latest_available_run, load_grib, merge, normalise, prev_steps, step_for,
+                   synthetic_fields)  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("render")
@@ -61,15 +62,31 @@ def padded(bbox):
 
 
 def render_frame(run_iso: str, fhr: int, region: str, param_ids: list[str],
-                 grib_path: str | None, out_dir: str, synthetic: bool) -> list[str]:
-    """Render every requested parameter for one (hour, region). Runs in a worker."""
+                 grib_paths: dict | None, out_dir: str, synthetic: bool) -> list[str]:
+    """Render every requested parameter for one (hour, region). Runs in a worker.
+    grib_paths: {"": main file, "_m24": file for fhr-24, "_f0": file for hour 0, ...}"""
     run = dt.datetime.fromisoformat(run_iso)
     bbox = REGIONS[region]["bbox"]
-    fields = synthetic_fields(fhr, padded(bbox)) if synthetic else crop(load_grib(Path(grib_path)), padded(bbox))
+    if synthetic:
+        fields = synthetic_fields(fhr, padded(bbox))
+    else:
+        fields = load_grib(Path(grib_paths[""]))
+        for tag, path in grib_paths.items():
+            if tag and path:
+                try:
+                    fields = merge(fields, load_grib(Path(path), tag))
+                except Exception as e:  # noqa: BLE001
+                    log.warning("f%03d %s: previous-step file %s unreadable: %s", fhr, region, tag, e)
+        fields = crop(fields, padded(bbox))
+    fields = normalise(fields, fhr)
+    if fhr == 0 and region == list(REGIONS)[0]:
+        log.info("fields available at f000: %s", " ".join(sorted(fields)))
     meta = {"run": run, "fhr": fhr, "bbox": bbox, "region": region,
             "region_name": REGIONS[region]["name"]}
     written = []
     for pid in param_ids:
+        if fhr not in param_hours(pid):
+            continue
         fn = getattr(plots, PARAMS[pid]["plot"])
         dest = Path(out_dir) / region / pid / f"f{fhr:03d}.png"
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -107,10 +124,13 @@ def write_manifest(run_id: str, hours: list[int], regions: list[str], param_ids:
             manifest = None
     manifest = manifest or {"model": {}, "regions": {}, "params": {}}
     runs = [r for r in manifest.get("model", {}).get("runs", []) if r["id"] != run_id]
+    limited = {pid: [h for h in hours if h in param_hours(pid)] for pid in param_ids
+               if PARAMS[pid].get("max_hour") is not None}
     runs.append({
         "id": run_id,
         "init": dt.datetime.strptime(run_id, "%Y%m%d%H").replace(tzinfo=dt.timezone.utc).isoformat(),
         "hours": hours, "regions": regions, "params": param_ids,
+        "param_hours": limited,           # products rendered over fewer hours than the run
     })
     runs.sort(key=lambda r: r["id"], reverse=True)
     manifest["model"] = {"id": MODEL["id"], "name": MODEL["name"], "resolution": MODEL["resolution"],
@@ -143,7 +163,7 @@ def main():
     ap.add_argument("--run", help="YYYYMMDDHH; default = latest available on NOMADS")
     ap.add_argument("--hours", default=None, help="e.g. 0-120/6 or 0,6,12")
     ap.add_argument("--regions", nargs="*", default=list(REGIONS))
-    ap.add_argument("--params", nargs="*", default=MODEL["params"])
+    ap.add_argument("--params", nargs="*", default=model_params())
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--synthetic", action="store_true", help="fake data, no network")
     ap.add_argument("--keep-grib", action="store_true")
@@ -182,31 +202,54 @@ def main():
     pairs = all_fetch_pairs(args.params)
 
     # 1. download (sequential; both servers rate-limit aggressive parallel clients)
-    #    GFS: one regional subset per (hour, region). ECMWF: one global file per hour,
-    #    shared by every region (open data has no bbox subsetting).
-    grib_paths: dict[tuple[int, str], str | None] = {}
+    #    GFS: one regional subset per (hour, region) plus small previous-step subsets.
+    #    ECMWF: one global file per step, shared by every region.
+    prev = prev_steps(args.params)
+    grib_paths: dict[tuple[int, str], dict | None] = {}
     for fhr in hours:
         if args.synthetic:
             for region in args.regions:
                 grib_paths[(fhr, region)] = None
             continue
         if MODEL["source"] == "ecmwf_opendata":
-            dest = grib_dir / f"global_f{fhr:03d}.grib2"
+            files = {}
             try:
-                download_ecmwf(run, fhr, args.params, dest)
-                for region in args.regions:
-                    grib_paths[(fhr, region)] = str(dest)
+                files[""] = str(download_ecmwf(run, fhr, ecmwf_pairs(args.params), grib_dir / f"global_f{fhr:03d}.grib2"))
             except RuntimeError as e:
-                log.error("%s", e)
+                log.error("%s", e); continue
+            for off, spec in prev.items():
+                step = step_for(fhr, off)
+                if step is None or not spec["ecmwf"]:
+                    continue
+                tag = "_f0" if off == "f0" else f"_m{off}"
+                try:
+                    files[tag] = str(download_ecmwf(run, step, spec["ecmwf"], grib_dir / f"global_f{step:03d}_{tag}.grib2"))
+                except RuntimeError as e:
+                    log.warning("%s", e)
+            for region in args.regions:
+                grib_paths[(fhr, region)] = files
             continue
         for region in args.regions:
-            url = build_filter_url(run, fhr, pairs, padded(REGIONS[region]["bbox"]))
-            dest = grib_dir / f"{region}_f{fhr:03d}.grb2"
+            bbox = padded(REGIONS[region]["bbox"])
+            files = {}
             try:
-                download(url, dest, session)
-                grib_paths[(fhr, region)] = str(dest)
+                dest = grib_dir / f"{region}_f{fhr:03d}.grb2"
+                download(build_filter_url(run, fhr, pairs, bbox), dest, session)
+                files[""] = str(dest)
             except RuntimeError as e:
-                log.error("%s", e)
+                log.error("%s", e); continue
+            for off, spec in prev.items():
+                step = step_for(fhr, off)
+                if step is None or not spec["fetch"]:
+                    continue
+                tag = "_f0" if off == "f0" else f"_m{off}"
+                dest = grib_dir / f"{region}_f{step:03d}{tag}.grb2"
+                try:
+                    download(build_filter_url(run, step, spec["fetch"], bbox), dest, session, retries=2)
+                    files[tag] = str(dest)
+                except RuntimeError as e:
+                    log.warning("%s", e)         # e.g. no APCP at step 0 — plots degrade gracefully
+            grib_paths[(fhr, region)] = files
 
     # 2. render in parallel
     jobs = [(fhr, region, p) for (fhr, region), p in grib_paths.items()]
