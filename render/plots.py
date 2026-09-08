@@ -22,7 +22,7 @@ import matplotlib.ticker
 import numpy as np
 from scipy.ndimage import gaussian_filter
 
-from config import DPI, FIG_SIZE, MODEL, SITE_NAME
+from config import DPI, FIG_SIZE, LABEL_CITIES, LABEL_REGIONS, MODEL, SITE_NAME
 
 log = logging.getLogger("plots")
 PC = ccrs.PlateCarree()
@@ -265,10 +265,16 @@ def plot_t2m(f, meta):
     levels = np.arange(-30, 121, 5)
     cf = ax.contourf(lon, lat, tf, levels=levels, cmap="turbo", extend="both", transform=PC, zorder=2)
     ax.contour(lon, lat, tf, levels=[32], colors="k", linewidths=1.0, linestyles="dashed", transform=PC, zorder=4)
+    step = 5 if meta.get("region") in LABEL_REGIONS else 10
+    cs = ax.contour(lon, lat, smooth(tf, 1.0), levels=np.arange(-30, 125, step), colors="#222", linewidths=0.5, alpha=0.7, transform=PC, zorder=4)
+    ax.clabel(cs, fmt="%d", fontsize=7, inline=True, inline_spacing=2)
     if "prmsl" in f:
-        contour_labeled(ax, lon, lat, smooth(pick(f, "prmsl") / 100), mslp_levels(), "#333", 0.6)
+        contour_labeled(ax, lon, lat, smooth(pick(f, "prmsl") / 100), mslp_levels(), "#555", 0.5, linestyles="dashed")
+    f_tf = dict(f); f_tf["tf"] = tf
+    ff = type("F", (dict,), {})(f_tf); ff.lon, ff.lat = lon, lat
+    city_values(ax, ff, "tf", meta, fmt="{:.0f}°")
     add_basemap(ax)
-    colorbar(fig, cf, "2 m temperature (°F)", ticks=levels[::2])
+    colorbar(fig, cf, "2 m temperature (°F) — contours every %d °F" % step, ticks=levels[::2])
     title(fig, ax, meta, "2 m temperature (°F) & MSLP (mb)")
     return fig
 
@@ -290,6 +296,9 @@ def plot_wind10m(f, meta):
         mslp = smooth(pick(f, "prmsl") / 100)
         contour_labeled(ax, lon, lat, mslp, mslp_levels(), "black", 0.9)
         hilo(ax, lon, lat, mslp)
+    fs = dict(f); fs["spd"] = spd
+    ff = type("F", (dict,), {})(fs); ff.lon, ff.lat = lon, lat
+    city_values(ax, ff, "spd", meta, fmt="{:.0f} kt")
     add_basemap(ax)
     colorbar(fig, cf, "10 m wind speed (kt)", ticks=bounds)
     title(fig, ax, meta, "MSLP (mb) & 10 m wind (kt)")
@@ -329,6 +338,28 @@ def plot_cape(f, meta):
     colorbar(fig, cf, "Surface-based CAPE (J/kg)", ticks=bounds)
     title(fig, ax, meta, "Surface-based CAPE (J/kg), 850 mb (red) & 500 mb (blue) wind (kt)")
     return fig
+
+
+def city_values(ax, f, key, meta, fmt="{:.0f}", scale=1.0, offset=0.0, color="#111"):
+    """Print a field's value at each labelled city (Florida/Gulf/Southeast views only)."""
+    if meta.get("region") not in LABEL_REGIONS or key not in f:
+        return
+    lon0, lon1, lat0, lat1 = meta["bbox"]
+    small = (lon1 - lon0) <= 16
+    for name, la, lo in LABEL_CITIES:
+        if not (lon0 + 0.4 <= lo <= lon1 - 0.4 and lat0 + 0.3 <= la <= lat1 - 0.3):
+            continue
+        j = int(np.argmin(np.abs(f.lat - la))); i = int(np.argmin(np.abs(f.lon - lo)))
+        v = f[key][j, i]
+        if not np.isfinite(v):
+            continue
+        txt = fmt.format(v * scale + offset)
+        ax.plot(lo, la, "o", ms=3, color=color, mec="white", mew=0.6, transform=PC, zorder=9)
+        ax.text(lo, la + (0.12 if small else 0.25), txt, fontsize=9 if small else 8, fontweight="bold", ha="center", va="bottom",
+                color=color, transform=PC, zorder=9, path_effects=[matplotlib.patheffects.withStroke(linewidth=2.5, foreground="white")])
+        if small:
+            ax.text(lo, la - 0.12, name, fontsize=6.5, ha="center", va="top", color="#333", transform=PC, zorder=9,
+                    path_effects=[matplotlib.patheffects.withStroke(linewidth=2, foreground="white")])
 
 
 # ---------------------------------------------------- colour tables ---------
@@ -883,6 +914,9 @@ def plot_gust(f, meta):
     if "u10" in f:
         barbs(ax, lon, lat, pick(f, "u10") * 1.944, pick(f, "v10") * 1.944, color="#333")
     mslp_contours(ax, f, lw=0.7)
+    fg = dict(f); fg["gkt"] = g
+    ff = type("F", (dict,), {})(fg); ff.lon, ff.lat = lon, lat
+    city_values(ax, ff, "gkt", meta, fmt="{:.0f} kt")
     add_basemap(ax)
     colorbar(fig, cf, "10 m wind gust (kt)", ticks=bounds)
     title(fig, ax, meta, "10 m wind gust (kt)")

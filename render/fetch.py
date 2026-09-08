@@ -120,8 +120,7 @@ def _probe_url(run: dt.datetime, step: int, session=None) -> str | None:
         # AIFS-ENS publishes control and perturbed members as separate files (-cf / -pf); IFS ENS combines them (-ef)
         return url.replace("-enfo-ef.grib2", "-enfo-cf.grib2") if src == "ecmwf_aifs_ens" else url
     if src == "aigefs":
-        return GEFS_IDX.replace("/gens/prod/gefs.", "/aigefs/prod/aigefs.").format(
-            ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), mem=MODEL["members"][-1], fhr=step)
+        return aigefs_url(run, step, MODEL["members"][-1]) + ".idx"
     return None
 
 
@@ -263,6 +262,65 @@ def download_ecmwf(run: dt.datetime, step: int, pairs: set[tuple], dest: Path, r
     raise RuntimeError(f"Failed to download ECMWF step {step}")
 
 
+# grib_filter level names -> the wording NOAA uses inside .idx files
+_IDX_LEVEL = {
+    "surface": "surface", "mean_sea_level": "mean sea level", "2_m_above_ground": "2 m above ground",
+    "10_m_above_ground": "10 m above ground", "entire_atmosphere": "entire atmosphere",
+    "entire_atmosphere_\\(considered_as_a_single_layer\\)": "entire atmosphere (considered as a single layer)",
+    "top_of_atmosphere": "top of atmosphere", "PV=2e-06_(Km^2/kg/s)_surface": "PV=2e-06 (Km^2/kg/s) surface",
+}
+_IDX_CACHE: dict = {}
+_SKIP_LOGGED: set = set()
+
+
+def idx_url_for(run: dt.datetime, fhr: int) -> str | None:
+    ymd, hh = run.strftime("%Y%m%d"), run.strftime("%H")
+    if MODEL["source"] == "nomads_grid":
+        return MODEL["idx"].format(ymd=ymd, hh=hh, fhr=fhr)
+    if MODEL["source"] == "nomads":
+        return NOMADS_IDX.format(ymd=ymd, hh=hh).replace("f000.idx", f"f{fhr:03d}.idx")
+    return None
+
+
+def available_pairs(run: dt.datetime, fhr: int, pairs, session) -> set:
+    """Keep only (VAR, level) pairs that this hour's .idx says are in the file.
+    grib_filter answers HTTP 500 to a request naming anything absent, so this
+    is what makes mixed requests survive across models. Falls back to all pairs
+    if the .idx can't be read."""
+    url = idx_url_for(run, fhr)
+    if not url:
+        return set(pairs)
+    if url not in _IDX_CACHE:
+        try:
+            r = session.get(url, timeout=60)
+            if r.status_code != 200:
+                log.info("idx %s -> HTTP %s; requesting all fields", url.rsplit("/", 1)[-1], r.status_code)
+                return set(pairs)
+            present = set()
+            for line in r.text.splitlines():
+                parts = line.split(":")
+                if len(parts) > 4:
+                    present.add((parts[3], parts[4]))
+            _IDX_CACHE[url] = present
+        except requests.RequestException as e:
+            log.info("idx fetch failed (%s); requesting all fields", str(e)[:60]); return set(pairs)
+    present = _IDX_CACHE[url]
+    norm = lambda t: t.replace(" (considered as a single layer)", "").strip()
+    present_n = {(v, norm(l)) for v, l in present}
+    keep, dropped = set(), []
+    for var, lev in pairs:
+        lev_txt = norm(_IDX_LEVEL.get(lev, lev.replace("_", " ")))
+        if (var, lev_txt) in present_n:
+            keep.add((var, lev))
+        else:
+            dropped.append(f"{var}@{lev}")
+    if dropped and (fhr, tuple(sorted(dropped))) not in _SKIP_LOGGED:
+        _SKIP_LOGGED.add((fhr, tuple(sorted(dropped))))
+        if len(_SKIP_LOGGED) <= 6:
+            log.info("f%03d: not in this model's file, skipped: %s", fhr, " ".join(sorted(dropped)))
+    return keep
+
+
 def grid_filter_url(run: dt.datetime, fhr: int, pairs) -> str:
     """grib_filter URL for the CONUS mesoscale models (HRRR/NAM/NBM): whole grid,
     selected fields only. These grids are Lambert, so no lat/lon subregion."""
@@ -299,6 +357,29 @@ def build_filter_url(run: dt.datetime, fhr: int, pairs: set[tuple[str, str]],
 
 BACKOFF = [5, 10, 20, 30, 45, 60]
 
+# Circuit breaker: hosts that refuse connections repeatedly (per-IP rate limiting)
+# get marked dead for this process so a slice fails in minutes, not hours.
+_HOST_FAILS: dict = {}
+_DEAD_HOSTS: set = set()
+
+
+def _host(url: str) -> str:
+    return url.split("/")[2] if "//" in url else url
+
+
+def note_conn_failure(url: str):
+    h = _host(url); _HOST_FAILS[h] = _HOST_FAILS.get(h, 0) + 1
+    if _HOST_FAILS[h] >= 3 and h not in _DEAD_HOSTS:
+        _DEAD_HOSTS.add(h); log.error("%s refused %d connections in a row; giving up on it for this job", h, _HOST_FAILS[h])
+
+
+def note_conn_ok(url: str):
+    _HOST_FAILS[_host(url)] = 0
+
+
+def host_dead(url: str) -> bool:
+    return _host(url) in _DEAD_HOSTS
+
 
 def download(url: str, dest: Path, session: requests.Session, retries: int = 6) -> Path:
     """NOMADS returns 500/503 freely when busy; back off progressively."""
@@ -306,8 +387,11 @@ def download(url: str, dest: Path, session: requests.Session, retries: int = 6) 
     if dest.exists() and dest.stat().st_size > 1000:
         return dest
     for attempt in range(retries):
+        if host_dead(url):
+            raise RuntimeError(f"host unreachable: {url}")
         try:
             r = session.get(url, timeout=120)
+            note_conn_ok(url)
             if r.status_code == 200 and len(r.content) > 1000:
                 dest.write_bytes(r.content)
                 return dest
@@ -315,7 +399,8 @@ def download(url: str, dest: Path, session: requests.Session, retries: int = 6) 
                 raise RuntimeError(f"404 {url}")
             log.warning("GET %s -> %s (%d bytes), attempt %d", url[:80], r.status_code, len(r.content), attempt + 1)
         except requests.RequestException as e:
-            log.warning("GET failed (attempt %d): %s", attempt + 1, e)
+            note_conn_failure(url)
+            log.warning("GET failed (attempt %d): %s", attempt + 1, str(e)[:100])
         time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
     raise RuntimeError(f"Failed to download {url}")
 
@@ -367,6 +452,7 @@ def download_grouped(run: dt.datetime, fhr: int, pairs: set, bbox, dest: Path,
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 1000:
         return dest
+    pairs = available_pairs(run, fhr, pairs, session)
     groups: dict[str, set] = {}
     for var, lev in pairs:
         groups.setdefault(_group_of(lev), set()).add((var, lev))
@@ -633,6 +719,131 @@ def gefs_member_url(run: dt.datetime, fhr: int, member: str, pairs, bbox) -> str
     return GEFS_FILTER + "?" + urlencode(q, safe="\\()")
 
 
+# ------------------------------------------------------------- AI-GEFS ------
+
+_AIGEFS_TYPES: list | None = None      # file types (pres, sfc, ...) found in a member folder
+_AIGEFS_FIELD_FILE: dict = {}          # (VAR, level) -> file type that carries it
+
+
+def aigefs_url(run: dt.datetime, fhr: int, member: str, ftype: str = "pres") -> str:
+    n = 0 if member == "c00" else int(member[1:])
+    return MODEL["path"].format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), mem=n, fhr=fhr).replace(".pres.", f".{ftype}.")
+
+
+def aigefs_file_types(run: dt.datetime, session) -> list:
+    """Distinct file types in a member's grib2 folder, e.g. ['pres', 'sfc']."""
+    global _AIGEFS_TYPES
+    if _AIGEFS_TYPES is not None:
+        return _AIGEFS_TYPES
+    folder = aigefs_url(run, 0, "c00").rsplit("/", 1)[0] + "/"
+    names = [f for f in _listing(session, folder, retries=2, timeout=30) if f.endswith(".grib2")]
+    types = sorted({f.split(".")[2] for f in names if f.count(".") >= 4})
+    log.info("AI-GEFS file types in %s: %s (%d files)", folder, types or "listing unavailable", len(names))
+    _AIGEFS_TYPES = types or ["pres"]
+    return _AIGEFS_TYPES
+
+
+def aigefs_locate_fields(run: dt.datetime, fhr: int, member: str, wanted, session) -> dict:
+    """{file type: [wanted fields found in that type's index]}; logs anything not found anywhere."""
+    if _AIGEFS_FIELD_FILE:
+        out = {}
+        for w in wanted:
+            t = _AIGEFS_FIELD_FILE.get(w)
+            if t:
+                out.setdefault(t, []).append(w)
+        return out
+    remaining = list(wanted); out = {}
+    for t in aigefs_file_types(run, session):
+        if not remaining:
+            break
+        try:
+            r = session.get(aigefs_url(run, fhr, member, t) + ".idx", timeout=60)
+            if r.status_code != 200:
+                continue
+        except requests.RequestException:
+            continue
+        present = set()
+        for line in r.text.splitlines():
+            parts = line.split(":")
+            if len(parts) > 4:
+                present.add((parts[3], parts[4]))
+        found = [w for w in remaining if w in present]
+        for w in found:
+            _AIGEFS_FIELD_FILE[w] = t
+        if found:
+            out[t] = found
+        remaining = [w for w in remaining if w not in found]
+    if remaining:
+        log.warning("AI-GEFS: fields not found in any file type %s: %s", aigefs_file_types(run, session), remaining)
+    return out
+
+
+def nomads_idx_ranges(idx_url: str, wanted, session, retries: int = 3):
+    """Byte ranges for wanted (VAR, level-text) fields from a NOMADS .idx
+    (lines like  12:3456789:d=2026090718:TMP:850 mb:24 hour fcst:). The last
+    field's length is unknown, so it's fetched to end-of-file."""
+    text = None
+    for attempt in range(retries):
+        try:
+            r = session.get(idx_url, timeout=60)
+            if r.status_code == 200:
+                text = r.text; break
+            if r.status_code == 404:
+                raise RuntimeError(f"404 {idx_url}")
+        except requests.RequestException as e:
+            log.info("idx fetch failed (%d): %s", attempt + 1, str(e)[:80])
+        time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
+    if text is None:
+        raise RuntimeError(f"idx unavailable: {idx_url}")
+    rows = []
+    for line in text.splitlines():
+        parts = line.split(":")
+        if len(parts) > 5:
+            rows.append((int(parts[1]), parts[3], parts[4]))
+    want = set(wanted); ranges = []
+    for i, (off, var, lev) in enumerate(rows):
+        if (var, lev) in want:
+            end = rows[i + 1][0] if i + 1 < len(rows) else None
+            ranges.append((off, (end - off) if end else None))
+    return ranges
+
+
+def download_aigefs_member(run: dt.datetime, fhr: int, member: str, dest: Path, session) -> Path:
+    """Pull the wanted fields for one member/hour from whichever file types hold them."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.stat().st_size > 1000:
+        return dest
+    wanted = [(v, l) for v, l in MODEL["idx_fields"] if not (v == "APCP" and fhr == 0)]
+    by_type = aigefs_locate_fields(run, fhr, member, wanted, session)
+    if not by_type:
+        raise RuntimeError(f"no wanted fields found for {member} f{fhr:03d}")
+    tmp = dest.with_suffix(".part")
+    with open(tmp, "wb") as out:
+        for ftype, flds in by_type.items():
+            url = aigefs_url(run, fhr, member, ftype)
+            ranges = nomads_idx_ranges(url + ".idx", flds, session)
+            for off, ln in sorted(ranges):
+                hdr = {"Range": f"bytes={off}-{off + ln - 1}" if ln else f"bytes={off}-"}
+                for attempt in range(4):
+                    if host_dead(url):
+                        raise RuntimeError(f"host unreachable: {url}")
+                    try:
+                        r = session.get(url, headers=hdr, timeout=120)
+                        note_conn_ok(url)
+                        if r.status_code in (200, 206):
+                            out.write(r.content); break
+                        if r.status_code == 404:
+                            raise RuntimeError(f"404 {url}")
+                    except requests.RequestException as e:
+                        note_conn_failure(url)
+                        log.info("range fetch failed (%d): %s", attempt + 1, str(e)[:80])
+                    time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
+                else:
+                    tmp.unlink(missing_ok=True); raise RuntimeError(f"range download failed: {url}")
+    tmp.rename(dest)
+    return dest
+
+
 # ------------------------------------------------------------- CMC GDPS -----
 # MSC Datamart (2025+ layout): one GRIB2 per field per step, global 0.15° lat-lon.
 #   https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gdps/15km/{hh}/{fhr}/
@@ -770,8 +981,10 @@ _GEPS_TMPL: dict | None = None      # {"file": template with {token}/{fhr}, "sty
 
 GEPS_CLASSIC = {  # generic -> classic Datamart token (GEPS zero-pads levels: ISBL_0500)
     "gh": "HGT_ISBL_{lev:04d}", "t": "TMP_ISBL_{lev:04d}", "u": "UGRD_ISBL_{lev:04d}", "v": "VGRD_ISBL_{lev:04d}",
-    "msl": "PRMSL_MSL_0", "tp": "APCP_SFC_0", "2t": "TMP_TGL_2", "10u": "UGRD_TGL_10", "10v": "VGRD_TGL_10",
+    "msl": "PRMSL_MSL_0", "tp": "APCP_SFC_0", "2t": "TMP_TGL_2m", "10u": "UGRD_TGL_10m", "10v": "VGRD_TGL_10m",
 }
+# alternative spellings to try if the first 404s (near-surface levels vary between MSC products)
+GEPS_ALT = {"2t": ["TMP_TGL_2m", "TMP_TGL_2"], "10u": ["UGRD_TGL_10m", "UGRD_TGL_10"], "10v": ["VGRD_TGL_10m", "VGRD_TGL_10"]}
 
 
 def geps_template(run: dt.datetime, session) -> dict:
@@ -826,18 +1039,31 @@ def download_geps(run: dt.datetime, step: int, fields, dest: Path, session: requ
             t = tm["tokens"].get(name)
             if not t:
                 log.warning("GEPS: no token for %s", name); continue
-            token = t.format(lev=int(lev)) if lev is not None else t
-            url = GEPS_DIR.format(ymd=ymd, hh=hh, fhr=step) + tm["file"].format(token=token, fhr=step)
-            for attempt in range(4):
-                try:
-                    r = session.get(url, timeout=300)
-                    if r.status_code == 200 and len(r.content) > 500:
-                        out.write(r.content); got += 1; break
-                    if r.status_code == 404:
-                        log.warning("missing: %s", url.rsplit("/", 1)[-1]); break
-                except requests.RequestException as e:
-                    log.info("GET failed (%d): %s", attempt + 1, str(e)[:80])
-                time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
+            candidates = GEPS_ALT.get(name, [t]) if tm["style"] == "classic" else [t]
+            done = False
+            for cand in candidates:
+                token = cand.format(lev=int(lev)) if lev is not None else cand
+                url = GEPS_DIR.format(ymd=ymd, hh=hh, fhr=step) + tm["file"].format(token=token, fhr=step)
+                for attempt in range(3):
+                    if host_dead(url):
+                        break
+                    try:
+                        r = session.get(url, timeout=90)
+                        note_conn_ok(url)
+                        if r.status_code == 200 and len(r.content) > 500:
+                            out.write(r.content); got += 1; done = True; break
+                        if r.status_code == 404:
+                            break
+                    except requests.RequestException as e:
+                        note_conn_failure(url)
+                        log.info("GET failed (%d): %s", attempt + 1, str(e)[:80])
+                    time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
+                if host_dead(url):
+                    break
+                if done:
+                    break
+            if not done:
+                log.warning("missing: %s (tried %s)", name, " ".join(candidates))
     if got == 0:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(f"No GEPS fields downloaded for step {step}")
@@ -932,8 +1158,11 @@ def download_files(run: dt.datetime, step: int, pairs: set, dest: Path, session:
     with open(raw, "wb") as out:
         for url in urls:
             for attempt in range(retries):
+                if host_dead(url):
+                    break
                 try:
                     r = session.get(url, timeout=60)
+                    note_conn_ok(url)
                     if r.status_code == 200 and len(r.content) > 500:
                         data = bz2.decompress(r.content) if url.endswith(".bz2") else r.content
                         out.write(data); got += 1
@@ -942,8 +1171,11 @@ def download_files(run: dt.datetime, step: int, pairs: set, dest: Path, session:
                         log.warning("missing: %s", url.rsplit("/", 1)[-1]); break
                     log.warning("GET %s -> %s", url.rsplit("/", 1)[-1], r.status_code)
                 except (requests.RequestException, OSError) as e:
-                    log.warning("GET failed (%d): %s", attempt + 1, e)
+                    note_conn_failure(url)
+                    log.warning("GET failed (%d): %s", attempt + 1, str(e)[:100])
                 time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
+            if host_dead(url):
+                break
     if got == 0:
         raw.unlink(missing_ok=True)
         raise RuntimeError(f"No fields downloaded for step {step}")
@@ -1026,7 +1258,7 @@ def _regrid_index(lats2d, lons2d, res: float):
     return _REGRID_CACHE[key]
 
 
-def load_grib(path: Path, tag: str = "") -> Fields:
+def load_grib(path: Path, tag: str = "", bbox=None) -> Fields:
     """Read every message in a GRIB file into Fields keyed so that plots can
     tell fields apart unambiguously:
 
@@ -1086,10 +1318,17 @@ def load_grib(path: Path, tag: str = "") -> Fields:
                     else:                                   # Lambert etc.: regrid to lat/lon
                         tlon, tlat, ridx, rmask, rshape = _regrid_index(lats, lons, MODEL.get("grid_res", 0.05))
                         lat, lon = tlat, tlon
+                        if bbox is not None:                # only keep the window this frame needs
+                            b0, b1, c0, c1 = bbox
+                            li = np.where((tlon >= b0) & (tlon <= b1))[0]; la = np.where((tlat >= c0) & (tlat <= c1))[0]
+                            if len(li) > 4 and len(la) > 4:
+                                sub = np.ix_(la, li)
+                                ridx = ridx.reshape(rshape)[sub].ravel(); rmask = rmask.reshape(rshape)[sub].ravel()
+                                rshape = (len(la), len(li)); lat, lon = tlat[la], tlon[li]
                 if not regular:
-                    v = vals.ravel()[ridx].reshape(rshape); v[rmask] = np.nan; vals = v
+                    v = vals.ravel()[ridx].astype(np.float32); v[rmask] = np.nan; vals = v.reshape(rshape)
                 if key not in out:                 # first occurrence wins (e.g. duplicate tp records)
-                    out[key] = np.asarray(vals, dtype=float)
+                    out[key] = np.asarray(vals, dtype=np.float32 if not regular else float)
             finally:
                 ec.codes_release(h)
     if lat is None:
